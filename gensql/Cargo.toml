@@ -1,0 +1,18 @@
+[package]
+name = "gensql"
+version = "1.0.0"
+edition = "2021"
+authors = ["kiven <kivensoft@gmail.com>"]
+description = "A simple sql generator library"
+
+[features]
+default = ["mysql"]
+mysql = ["mysql_common"]
+
+[dependencies]
+thiserror = "1.0"
+log = "0.4"
+mysql_common = { version = "0.29", optional = true }
+itoa = "1.0"
+smallvec = { version = "1.10", features = ["write"] }
+compact_str = { version = "0.7", features = ["serde", "bytes"] }
