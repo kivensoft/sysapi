@@ -30,7 +30,7 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
     type Req = super::GetReq;
 
     let param: Req = ctx.into_json().await?;
-    let rec = SysPermission::select_by_id(param.id).await;
+    let rec = SysPermission::select_by_id(&param.id).await;
 
     match check_result!(rec) {
         Some(rec) => Resp::ok(&rec),
@@ -59,16 +59,13 @@ pub async fn post(ctx: HttpContext) -> HttpResult {
         None => SysPermission::insert(&param).await.map(|(_, id)| id),
     });
 
-    tokio::spawn(async move {
-        let msg = SysPermission { permission_id: Some(id), ..Default::default() };
-        let chan = rmq::make_channel(rmq::ChannelName::ModPermission);
-        let op = match param.permission_id {
-            Some(_) => rmq::RecChanged::publish_update(&chan, msg).await,
-            None => rmq::RecChanged::publish_insert(&chan, msg).await,
-        };
-        if let Err(e) = op {
-            log::error!("redis发布消息失败: {e:?}");
-        }
+    let typ = match param.permission_id {
+        Some(_) => rmq::RecordChangedType::Update,
+        None => rmq::RecordChangedType::Insert,
+    };
+    rmq::publish_rec_change_spawm(rmq::ChannelName::ModConfig, typ, SysPermission {
+        permission_id: Some(id),
+        ..Default::default()
     });
 
     Resp::ok( &Res {
@@ -82,14 +79,16 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
     type Req = super::GetReq;
 
     let param: Req = ctx.into_json().await?;
-    let r = SysPermission::delete_by_id(param.id).await;
+    let r = SysPermission::delete_by_id(&param.id).await;
     check_result!(r);
 
-    let chan = rmq::make_channel(rmq::ChannelName::ModPermission);
-    rmq::RecChanged::publish_delete(&chan, SysPermission {
-        permission_id: Some(param.id),
-        ..Default::default()
-    }).await?;
+    rmq::publish_rec_change_spawm(rmq::ChannelName::ModPermission,
+        rmq::RecordChangedType::Delete,
+        SysPermission {
+            permission_id: Some(param.id),
+            ..Default::default()
+        }
+    );
 
     Resp::ok_with_empty()
 }
@@ -130,6 +129,15 @@ pub async fn rearrange(ctx: HttpContext) -> HttpResult {
     let param: Req = ctx.into_json().await?;
     check_result!(SysPermission::rearrange(&param).await);
 
+    rmq::publish_rec_change_spawm::<Option<()>>(rmq::ChannelName::ModPermission,
+        rmq::RecordChangedType::All, None);
+    rmq::publish_rec_change_spawm::<Option<()>>(rmq::ChannelName::ModApi,
+        rmq::RecordChangedType::All, None);
+    rmq::publish_rec_change_spawm::<Option<()>>(rmq::ChannelName::ModRole,
+        rmq::RecordChangedType::All, None);
+    rmq::publish_rec_change_spawm::<Option<()>>(rmq::ChannelName::ModMenu,
+        rmq::RecordChangedType::All, None);
+
     Resp::ok_with_empty()
 }
 
@@ -146,17 +154,13 @@ fn make_tree<'a>(dicts: &'a [SysDict], permissions: &'a [SysPermission]) -> Vec<
     for item in permissions.iter() {
         pmap.entry(item.group_code.unwrap())
             .and_modify(|v| v.push(item))
-            .or_insert_with(|| {
-                let mut vec = Vec::new();
-                vec.push(item);
-                vec
-            });
+            .or_insert_with(|| vec![item]);
     }
 
     let result = dicts.iter()
         .map(|dict| {
             let permissions = pmap.remove(&dict.dict_code.unwrap())
-                .unwrap_or_else(Vec::new);
+                .unwrap_or_default();
 
             TreeItem {
                 dict,

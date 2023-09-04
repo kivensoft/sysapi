@@ -1,7 +1,269 @@
+//! generator sql module
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "mysql")] {
+        mod db_mysql;
+        use db_mysql as db;
+    // } else if #[cfg(feature = "postgresql")] {
+    }
+}
+
+pub use serde;
+pub use db::{
+    Conn, Value, ToValue, Queryable, Transaction,
+    get_conn, try_connect, init_pool,
+    exec_sql, insert_sql, query_all_sql, query_one_sql,
+};
+
 use compact_str::{CompactString, format_compact};
 use itoa::Buffer;
-use mysql_common::{value::{Value, convert::ToValue}, params::Params};
 use thiserror::Error;
+
+#[macro_export]
+macro_rules! vec_value {
+    ($($x:expr),+ $(,)?) => {
+        vec![ $($crate::ToValue::to_value(&$x),)* ]
+    };
+}
+
+#[macro_export]
+macro_rules! row_map {
+    ($data_type:tt, $($e:tt,)*) => {
+        |( $( $e, )*)| $data_type {
+            $( $e,)*
+            ..Default::default()
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! option_struct {
+    ( $struct_name:ident, $($field:ident : $f_type:tt,)+ ) => {
+        #[derive($crate::serde::Serialize, $crate::serde::Deserialize, Default, Debug, Clone)]
+        #[serde(rename_all = "camelCase")]
+        pub struct $struct_name {
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pub $id_name: Option<$id_type>,
+            $(
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pub $field: Option<$f_type>,
+            )*
+        }
+    }
+}
+
+/// 创建数据库表的结构宏
+///
+/// ## Examples
+///
+/// ```rust
+/// use gensql;
+///
+/// gensql::table_define!(t_sys_config, SysConfig,
+///     cfg_id: u32 => CFG_ID,
+///     cfg_name: String => CFG_NAME,
+///     cfg_value: String => CFG_VALUE,
+///     updated_time: LocalTime => UPDATED_TIME,
+///     cfg_remark: String => CFG_REMARK,
+/// );
+///
+/// ```
+#[macro_export]
+macro_rules! table_define {
+
+    ( $table_name:literal, $struct_name:ident, $id_name:ident: $id_type:tt => $id_alias:ident,
+            $($field:ident : $f_type:tt => $field_name:ident,)+ ) => {
+
+        #[derive($crate::serde::Serialize, $crate::serde::Deserialize, Default, Debug, Clone)]
+        #[serde(rename_all = "camelCase")]
+        pub struct $struct_name {
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pub $id_name: Option<$id_type>,
+            $(
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pub $field: Option<$f_type>,
+            )*
+        }
+
+        impl $struct_name {
+            pub const TABLE: &str = $table_name;
+            pub const ID: &str = stringify!($id_name);
+            pub const $id_alias: &str = stringify!($id_name);
+            $(
+                pub const $field_name: &str = stringify!($field);
+            )*
+
+            /// 删除记录
+            pub async fn delete_by_id(id: &$id_type) -> Result<u32> {
+                let (sql, params) = Self::stmt_delete(id);
+                $crate::exec_sql(&sql, &params).await
+            }
+
+            /// 插入记录，返回(插入记录数量, 自增ID的值)
+            pub async fn insert(value: &Self) -> Result<(u32, u32)> {
+                let (sql, params) = Self::stmt_insert(value);
+                $crate::insert_sql(&sql, &params).await
+            }
+
+            /// 更新记录
+            pub async fn update_by_id(value: &Self) -> Result<u32> {
+                let (sql, params) = Self::stmt_update(value);
+                $crate::exec_sql(&sql, &params).await
+            }
+
+            /// 动态字段更新, 只更新有值的字段
+            pub async fn update_dyn_by_id(value: &Self) -> Result<u32> {
+                let (sql, params) = Self::stmt_update_dynamic(value);
+                $crate::exec_sql(&sql, &params).await
+            }
+
+            /// 查询记录
+            pub async fn select_by_id(id: &$id_type) -> Result<Option<Self>> {
+                let (sql, params) = Self::stmt_select(id);
+                Ok($crate::query_one_sql(&sql, &params).await?.map(Self::row_map))
+            }
+
+            pub fn stmt_delete(id: &$id_type) -> (String, Vec<$crate::Value>) {
+                use $crate::ToValue;
+
+                let mut sql = String::new();
+                sql.push_str("delete from ");
+                sql.push_str($table_name);
+                sql.push_str(" where ");
+                sql.push_str(stringify!($id_name));
+                sql.push_str(" = ?");
+
+                let params = vec![id.to_value()];
+
+                $crate::log_sql_params(&sql, &params);
+
+                (sql, params)
+            }
+
+            pub fn stmt_insert(val: &$struct_name) -> (String, Vec<$crate::Value>) {
+                use $crate::ToValue;
+
+                let params = vec![
+                    val.$id_name.to_value(),
+                    $(
+                        val.$field.to_value(),
+                    )*
+                ];
+
+                let mut sql = String::new();
+                sql.push_str("insert into ");
+                sql.push_str($table_name);
+                sql.push_str(" (");
+                sql.push_str(stringify!($id_name));
+                $(
+                    sql.push_str(", ");
+                    sql.push_str(stringify!($field));
+                )*
+                sql.push_str(") values (?");
+                for i in 1..params.len() { sql.push_str(", ?"); }
+                sql.push_str(")");
+
+                $crate::log_sql_params(&sql, &params);
+
+                (sql, params)
+            }
+
+            pub fn stmt_select(id: &$id_type) -> (String, Vec<$crate::Value>) {
+                use $crate::ToValue;
+
+                let mut sql = String::new();
+                sql.push_str("select ");
+                sql.push_str(stringify!($id_name));
+                $(
+                    sql.push_str(", ");
+                    sql.push_str(stringify!($field));
+                )*
+                sql.push_str(" from ");
+                sql.push_str($table_name);
+                sql.push_str(" where ");
+                sql.push_str(stringify!($id_name));
+                sql.push_str(" = ?");
+
+                let params = vec![id.to_value()];
+
+                $crate::log_sql_params(&sql, &params);
+
+                (sql, params)
+            }
+
+            pub fn stmt_update(val: &$struct_name) -> (String, Vec<$crate::Value>) {
+                use $crate::ToValue;
+
+                let mut sql = String::new();
+                sql.push_str("update ");
+                sql.push_str($table_name);
+                sql.push_str(" set ");
+                $(
+                    sql.push_str(stringify!($field));
+                    sql.push_str(" = ?, ");
+                )*
+                sql.truncate(sql.len() - 2);
+                sql.push_str(" where ");
+                sql.push_str(stringify!($id_name));
+                sql.push_str(" = ?");
+
+                let params = vec![
+                    $( val.$field.to_value(), )*
+                    val.$id_name.to_value(),
+                ];
+
+                $crate::log_sql_params(&sql, &params);
+
+                (sql, params)
+            }
+
+            pub fn stmt_update_dynamic(val: &$struct_name) -> (String, Vec<$crate::Value>) {
+                use $crate::ToValue;
+
+                let mut params = Vec::new();
+                let mut sql = String::new();
+                sql.push_str("update ");
+                sql.push_str($table_name);
+                sql.push_str(" set ");
+                $(
+                    if val.$field.is_some() {
+                        sql.push_str(stringify!($field));
+                        sql.push_str(" = ?, ");
+                        params.push(val.$field.to_value());
+                    }
+                )*
+                sql.truncate(sql.len() - 2);
+                sql.push_str(" where ");
+                sql.push_str(stringify!($id_name));
+                sql.push_str(" = ?");
+                params.push(val.$id_name.to_value());
+
+                $crate::log_sql_params(&sql, &params);
+
+                (sql, params)
+            }
+
+            pub fn row_map(val: (Option<$id_type>, $( Option<$f_type>, )*)) -> $struct_name {
+                let ($id_name, $( $field, )*) = val;
+                $struct_name {
+                    $id_name,
+                    $( $field, )*
+                }
+            }
+
+            pub fn fields() -> Vec<&'static str> {
+                vec![
+                    stringify!($id_name),
+                    $(
+                        stringify!($field),
+                    )*
+                ]
+            }
+
+        }
+
+    }
+}
 
 const AND: &str = "and ";
 const OR: &str = "or ";
@@ -49,226 +311,12 @@ pub struct TrimSql<T: GeneratorSql> {
 
 pub struct WhereSql<T: GeneratorSql>(TrimSql<T>);
 
+
 #[derive(PartialEq)]
 enum LikeType {
     Full,
     Left,
     Right,
-}
-
-#[macro_export]
-macro_rules! vec_value {
-    ($($x:expr),+ $(,)?) => {
-        vec![ $(mysql_common::value::convert::ToValue::to_value(&$x),)* ]
-    };
-}
-
-#[macro_export]
-macro_rules! row_map {
-    ($data_type:tt, $($e:tt,)*) => {
-        |( $( $e, )*)| $data_type {
-            $( $e,)*
-            ..Default::default()
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! option_struct {
-    ( $struct_name:ident, $($field:ident : $f_type:tt,)+ ) => {
-        #[derive(serde::Serialize, serde::Deserialize, Default, Debug, Clone)]
-        #[serde(rename_all = "camelCase")]
-        pub struct $struct_name {
-                #[serde(skip_serializing_if = "Option::is_none")]
-                pub $id_name: Option<$id_type>,
-            $(
-                #[serde(skip_serializing_if = "Option::is_none")]
-                pub $field: Option<$f_type>,
-            )*
-        }
-    }
-}
-
-/// 创建数据库表的结构宏
-///
-/// ## Examples
-///
-/// ```rust
-/// use gensql;
-///
-/// gensql::table_define!(t_sys_config, SysConfig,
-///     cfg_id: u32 => CFG_ID,
-///     cfg_name: String => CFG_NAME,
-///     cfg_value: String => CFG_VALUE,
-///     updated_time: LocalTime => UPDATED_TIME,
-///     cfg_remark: String => CFG_REMARK,
-/// );
-///
-/// ```
-#[macro_export]
-macro_rules! table_define {
-
-    ( $table_name:literal, $struct_name:ident, $id_name:ident: $id_type:tt => $id_alias:ident,
-            $($field:ident : $f_type:tt => $field_name:ident,)+ ) => {
-
-        #[derive(serde::Serialize, serde::Deserialize, Default, Debug, Clone)]
-        #[serde(rename_all = "camelCase")]
-        pub struct $struct_name {
-                #[serde(skip_serializing_if = "Option::is_none")]
-                pub $id_name: Option<$id_type>,
-            $(
-                #[serde(skip_serializing_if = "Option::is_none")]
-                pub $field: Option<$f_type>,
-            )*
-        }
-
-        impl $struct_name {
-            pub const TABLE: &str = $table_name;
-            pub const ID: &str = stringify!($id_name);
-            pub const $id_alias: &str = stringify!($id_name);
-            $(
-                pub const $field_name: &str = stringify!($field);
-            )*
-
-            pub fn stmt_delete(id: &$id_type) -> (String, mysql_common::params::Params) {
-                use mysql_common::{params::Params, value::convert::ToValue};
-
-                let mut sql = String::new();
-                sql.push_str("delete from ");
-                sql.push_str($table_name);
-                sql.push_str(" where ");
-                sql.push_str(stringify!($id_name));
-                sql.push_str(" = ?");
-
-                let params = vec![id.to_value()];
-
-                $crate::log_sql_params(&sql, &params);
-
-                (sql, Params::Positional(params))
-            }
-
-            pub fn stmt_insert(val: &$struct_name) -> (String, mysql_common::params::Params) {
-                use mysql_common::{params::Params, value::convert::ToValue};
-
-                let params = vec![
-                    val.$id_name.to_value(),
-                    $(
-                        val.$field.to_value(),
-                    )*
-                ];
-
-                let mut sql = String::new();
-                sql.push_str("insert into ");
-                sql.push_str($table_name);
-                sql.push_str(" (");
-                sql.push_str(stringify!($id_name));
-                $(
-                    sql.push_str(", ");
-                    sql.push_str(stringify!($field));
-                )*
-                sql.push_str(") values (?");
-                for i in 1..params.len() { sql.push_str(", ?"); }
-                sql.push_str(")");
-
-                $crate::log_sql_params(&sql, &params);
-
-                (sql, Params::Positional(params))
-            }
-
-            pub fn stmt_select(id: &$id_type) -> (String, mysql_common::params::Params) {
-                use mysql_common::{params::Params, value::convert::ToValue};
-
-                let mut sql = String::new();
-                sql.push_str("select ");
-                sql.push_str(stringify!($id_name));
-                $(
-                    sql.push_str(", ");
-                    sql.push_str(stringify!($field));
-                )*
-                sql.push_str(" from ");
-                sql.push_str($table_name);
-                sql.push_str(" where ");
-                sql.push_str(stringify!($id_name));
-                sql.push_str(" = ?");
-
-                let params = vec![id.to_value()];
-
-                $crate::log_sql_params(&sql, &params);
-
-                (sql, Params::Positional(params))
-            }
-
-            pub fn stmt_update(val: &$struct_name) -> (String, mysql_common::params::Params) {
-                use mysql_common::{params::Params, value::convert::ToValue};
-
-                let mut sql = String::new();
-                sql.push_str("update ");
-                sql.push_str($table_name);
-                sql.push_str(" set ");
-                $(
-                    sql.push_str(stringify!($field));
-                    sql.push_str(" = ?, ");
-                )*
-                sql.truncate(sql.len() - 2);
-                sql.push_str(" where ");
-                sql.push_str(stringify!($id_name));
-                sql.push_str(" = ?");
-
-                let params = vec![
-                    $( val.$field.to_value(), )*
-                    val.$id_name.to_value(),
-                ];
-
-                $crate::log_sql_params(&sql, &params);
-
-                (sql, Params::Positional(params))
-            }
-
-            pub fn stmt_update_dynamic(val: &$struct_name) -> (String, mysql_common::params::Params) {
-                use mysql_common::{params::Params, value::convert::ToValue};
-
-                let mut params = Vec::new();
-                let mut sql = String::new();
-                sql.push_str("update ");
-                sql.push_str($table_name);
-                sql.push_str(" set ");
-                $(
-                    if val.$field.is_some() {
-                        sql.push_str(stringify!($field));
-                        sql.push_str(" = ?, ");
-                        params.push(val.$field.to_value());
-                    }
-                )*
-                sql.truncate(sql.len() - 2);
-                sql.push_str(" where ");
-                sql.push_str(stringify!($id_name));
-                sql.push_str(" = ?");
-                params.push(val.$id_name.to_value());
-
-                $crate::log_sql_params(&sql, &params);
-
-                (sql, Params::Positional(params))
-            }
-
-            pub fn row_map(val: (Option<$id_type>, $( Option<$f_type>, )*)) -> $struct_name {
-                let ($id_name, $( $field, )*) = val;
-                $struct_name {
-                    $id_name,
-                    $( $field, )*
-                }
-            }
-
-            pub fn fields() -> Vec<&'static str> {
-                vec![
-                    stringify!($id_name),
-                    $(
-                        stringify!($field),
-                    )*
-                ]
-            }
-
-        }
-    }
 }
 
 #[inline]
@@ -283,7 +331,7 @@ pub fn log_sql_params(sql: &str, params: &[mysql_common::value::Value]) {
 }
 
 /// 将查询详细字段的语句转换为查询记录数量的语句
-pub fn select_count_from_sql(select_sql: &str) -> Result<String, GenSqlError> {
+pub fn trans_to_select_count(select_sql: &str) -> Result<String, GenSqlError> {
     let from_pos = match select_sql.find(" from ") {
         Some(pos) => pos,
         None => return Err(GenSqlError::UnsearchFrom),
@@ -477,19 +525,17 @@ impl SelectSql {
         self
     }
 
-    pub fn build(self) -> (String, Params) {
+    pub fn build(self) -> (String, Vec<Value>) {
         let sql = unsafe { String::from_utf8_unchecked(self.sql) };
-        let params = if self.params.is_empty() {
+        if self.params.is_empty() {
             log_sql(&sql);
-            Params::Empty
         } else {
             log_sql_params(&sql, &self.params);
-            Params::Positional(self.params)
-        };
-        (sql, params)
+        }
+        (sql, self.params)
     }
 
-    pub fn build_with_page(self) -> Result<(String, String, Params), GenSqlError> {
+    pub fn build_with_page(self) -> Result<(String, String, Vec<Value>), GenSqlError> {
         let mut sql = unsafe { String::from_utf8_unchecked(self.sql) };
         let mut total_sql = String::new();
 
@@ -508,17 +554,19 @@ impl SelectSql {
         }
 
 
-        let params = if self.params.is_empty() {
-            log_sql(&total_sql);
+        if self.params.is_empty() {
+            if !total_sql.is_empty() {
+                log_sql(&total_sql);
+            }
             log_sql(&sql);
-            Params::Empty
         } else {
-            log_sql(&total_sql);
+            if !total_sql.is_empty() {
+                log_sql(&total_sql);
+            }
             log_sql_params(&sql, &self.params);
-            Params::Positional(self.params)
-        };
+        }
 
-        Ok((total_sql, sql, params))
+        Ok((total_sql, sql, self.params))
     }
 
     fn pri_join(mut self, join_type: &str, table: &str, alias: &str) -> Self {
@@ -581,7 +629,7 @@ impl InsertSql {
         self
     }
 
-    pub fn build(mut self) -> (String, Params) {
+    pub fn build(mut self) -> (String, Vec<Value>) {
         debug_assert!(!self.params.is_empty());
         debug_assert!(self.sql.ends_with(b", "));
 
@@ -595,10 +643,9 @@ impl InsertSql {
         sql.push(b')');
 
         let sql = unsafe { String::from_utf8_unchecked(self.sql) };
-        let params = self.params;
-        log_sql_params(&sql, &params);
+        log_sql_params(&sql, &self.params);
 
-        (sql, Params::Positional(params))
+        (sql, self.params)
     }
 }
 
@@ -672,7 +719,7 @@ impl UpdateSql {
         WhereSql::new(self)
     }
 
-    pub fn build(mut self) -> (String, Params) {
+    pub fn build(mut self) -> (String, Vec<Value>) {
         debug_assert!(!self.params.is_empty());
 
         if self.sql.ends_with(b", ") {
@@ -680,10 +727,9 @@ impl UpdateSql {
         }
 
         let sql = unsafe { String::from_utf8_unchecked(self.sql) };
-        let params = self.params;
-        log_sql_params(&sql, &params);
+        log_sql_params(&sql, &self.params);
 
-        (sql, Params::Positional(params))
+        (sql, self.params)
     }
 }
 
@@ -709,12 +755,11 @@ impl DeleteSql {
         })
     }
 
-    pub fn build(self) -> (String, Params) {
+    pub fn build(self) -> (String, Vec<Value>) {
         let sql = unsafe { String::from_utf8_unchecked(self.sql) };
-        let params = self.params;
-        log_sql_params(&sql, &params);
+        log_sql_params(&sql, &self.params);
 
-        (sql, Params::Positional(params))
+        (sql, self.params)
     }
 }
 

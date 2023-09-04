@@ -20,7 +20,7 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
     type Req = super::GetReq;
 
     let param: Req = ctx.into_json().await?;
-    let rec = SysRole::select_by_id(param.id).await;
+    let rec = SysRole::select_by_id(&param.id).await;
 
     match check_result!(rec) {
         Some(rec) => Resp::ok(&rec),
@@ -47,18 +47,14 @@ pub async fn post(ctx: HttpContext) -> HttpResult {
         None => SysRole::insert(&param).await.map(|(_, id)| id),
     });
 
-    tokio::spawn(async move {
-        let msg = SysRole { role_id: Some(id), ..Default::default() };
-        let chan = rmq::make_channel(rmq::ChannelName::ModRole);
-        let op = match param.role_id {
-            Some(_) => rmq::RecChanged::publish_update(&chan, msg).await,
-            None => rmq::RecChanged::publish_insert(&chan, msg).await,
-        };
-        if let Err(e) = op {
-            log::error!("redis发布消息失败: {e:?}");
-        }
+    let typ = match param.role_id {
+        Some(_) => rmq::RecordChangedType::Update,
+        None => rmq::RecordChangedType::Insert,
+    };
+    rmq::publish_rec_change_spawm(rmq::ChannelName::ModRole, typ, SysRole {
+        role_id: Some(id),
+        ..Default::default()
     });
-
 
     Resp::ok( &Res {
         role_id: Some(id),
@@ -71,18 +67,15 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
     type Req = super::GetReq;
 
     let param: Req = ctx.into_json().await?;
-    check_result!(SysRole::delete_by_id(param.id).await);
+    check_result!(SysRole::delete_by_id(&param.id).await);
 
-    tokio::spawn(async move {
-        let chan = rmq::make_channel(rmq::ChannelName::ModRole);
-        let op = rmq::RecChanged::publish_delete(&chan, SysRole {
+    rmq::publish_rec_change_spawm(rmq::ChannelName::ModRole,
+        rmq::RecordChangedType::Delete,
+        SysRole {
             role_id: Some(param.id),
             ..Default::default()
-        }).await;
-        if let Err(e) = op {
-            log::error!("redis发布消息失败: {e:?}");
         }
-    });
+    );
 
     Resp::ok_with_empty()
 }

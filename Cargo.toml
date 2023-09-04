@@ -1,11 +1,12 @@
 # cargo build --release --target=x86_64-unknown-linux-musl
 [package]
 name = "sysapi"
-version = "0.7.1"
+version = "0.7.3"
 authors = ["kiven <kivensoft@gmail.com>"]
 edition = "2021"
 description = "system api for application"
 repository = "https://github.com/kivensoft/sysapi"
+build = "build.rs"
 
 [profile.release]
 opt-level = 'z'  # Optimize for size
@@ -51,8 +52,6 @@ smallstr = "0.3" # 基于栈的字符串
 itoa = "1.0" # 非常快速的整数转字符串库
 lru = { version = "0.10", default-features = false } # 简单迷你的lru缓存库
 deadpool-redis = { version = "0.11" }
-mysql_common = { version = "0.29", default-features = true }
-mysql_async = { version = "0.31", default-features = false }
 flate2 = { version = "1.0", features = ["rust_backend"] }
 fast_qr = { version = "0.8", features = ["image"] }
 asynclog = { version = "1.0", path = "asynclog" } # 支持同步和异步两种方式的迷你日志实现库

@@ -2,9 +2,8 @@ use std::{collections::HashMap, hash::Hash};
 
 use anyhow::{Result, Context};
 use compact_str::format_compact;
-use gensql::{table_define, vec_value};
+use gensql::{table_define, Transaction, get_conn, query_one_sql, vec_value, Queryable};
 use localtime::LocalTime;
-use mysql_async::{prelude::{Queryable, ToValue}, Transaction, TxOpts, Params};
 
 use crate::{
     db::{
@@ -14,7 +13,6 @@ use crate::{
         sys_role::SysRole,
     },
     utils::bits,
-    services::rmq,
 };
 
 use super::{PageData, PageInfo};
@@ -35,26 +33,6 @@ pub struct SysPermissionRearrange {
 }
 
 impl SysPermission {
-    /// 删除记录
-    pub async fn delete_by_id(id: u32) -> Result<u32> {
-        super::exec_sql(&Self::stmt_delete(&id)).await
-    }
-
-    /// 插入记录，返回(插入记录数量, 自增ID的值)
-    pub async fn insert(value: &SysPermission) -> Result<(u32, u32)> {
-        super::insert_sql(&Self::stmt_insert(value)).await
-    }
-
-    /// 更新记录
-    pub async fn update_by_id(value: &SysPermission) -> Result<u32> {
-        super::exec_sql(&Self::stmt_update(value)).await
-    }
-
-    /// 查询记录
-    pub async fn select_by_id(id: u32) -> Result<Option<SysPermission>> {
-        Ok(super::query_one_sql(&Self::stmt_select(&id)).await?.map(Self::row_map))
-    }
-
     /// 查询记录
     pub async fn select_page(value: &SysPermission, page: PageInfo) -> Result<PageData<SysPermission>> {
         let (tsql, psql, params) = gensql::SelectSql::with_page(page.index, page.size)
@@ -67,27 +45,27 @@ impl SysPermission {
             .order_by("", Self::PERMISSION_CODE)
             .build_with_page()?;
 
-        let mut conn = super::get_conn().await?;
+        let mut conn = get_conn().await?;
 
         let total = if tsql.is_empty() {
             0
         } else {
-            conn.exec_first(tsql, params.clone()).await?.map(|(total,)| total).unwrap_or(0)
+            conn.query_one_sql(tsql, params.clone()).await?.map(|(total,)| total).unwrap_or(0)
         };
 
-        let list = conn.exec_map(psql, params, Self::row_map).await?;
+        let list = conn.query_all_sql(psql, params, Self::row_map).await?;
 
         Ok(PageData { total, list, })
     }
 
     /// 查询permission_code最大值
     pub async fn select_max_code() -> Result<Option<u16>> {
-        let sql_params = gensql::SelectSql::new()
+        let (sql, params) = gensql::SelectSql::new()
             .select(&format_compact!("max({})", Self::PERMISSION_CODE))
             .from(Self::TABLE)
             .build();
 
-        super::query_one_sql(&sql_params).await
+        query_one_sql(&sql, &params).await
     }
 
     /// 加载所有记录
@@ -174,8 +152,8 @@ impl SysPermission {
         }
 
         // 获取数据库连接
-        let mut conn = super::get_conn().await?;
-        let mut conn = conn.start_transaction(TxOpts::new()).await?;
+        let mut conn = get_conn().await?;
+        let mut conn = conn.start_transaction().await?;
         let trans = &mut conn;
 
         Self::update_dicts(trans, &new_dict_list).await?;
@@ -187,13 +165,10 @@ impl SysPermission {
         // 提交事务
         conn.commit().await?;
 
-        // 发送记录变化的通知消息
-        Self::publish_modified();
-
         Ok(())
     }
 
-    fn slice_to_map<'a, K, V, F>(slice: &'a[V], f: F) -> HashMap<K, &'a V>
+    fn slice_to_map<K, V, F>(slice: &[V], f: F) -> HashMap<K, &V>
     where
         K: Eq + Hash,
         F: Fn(&V) -> K,
@@ -201,7 +176,7 @@ impl SysPermission {
         slice.iter().map(|v| (f(v), v)).collect()
     }
 
-    fn slice_group<'a, K, V, F>(slice: &'a[V], f: F) -> HashMap<K, Vec<&'a V>>
+    fn slice_group< K, V, F>(slice: &[V], f: F) -> HashMap<K, Vec<&V>>
     where
         K: Eq + Hash,
         F: Fn(&V) -> K,
@@ -210,11 +185,7 @@ impl SysPermission {
         for item in slice.iter() {
             map.entry(f(item))
                 .and_modify(|v| v.push(item))
-                .or_insert_with(|| {
-                    let mut vec = Vec::new();
-                    vec.push(item);
-                    vec
-                });
+                .or_insert_with(|| vec![item]);
         }
 
         map
@@ -226,12 +197,12 @@ impl SysPermission {
         type D = SysDict;
         let sql = format!("update {} set {} = ?, {} = ? where {} = ?",
                 D::TABLE, D::DICT_CODE, D::UPDATED_TIME, D::DICT_ID);
-        let now = LocalTime::now().to_value();
+        let now = LocalTime::now();
 
         for item in list.iter() {
-            let params = vec_value![item.1.to_value(), now, item.0.to_value()];
+            let params = vec_value![item.1, now, item.0];
             gensql::log_sql_params(&sql, &params);
-            conn.exec_drop(&sql, Params::Positional(params)).await?;
+            conn.exec_sql(&sql, params).await?;
         }
 
         Ok(())
@@ -244,13 +215,12 @@ impl SysPermission {
         let sql = format!("update {} set {} = ?, {} = ?, {} = ? where {} = ?",
                 T::TABLE, T::GROUP_CODE, T::PERMISSION_CODE, T::UPDATED_TIME,
                 T::PERMISSION_ID);
-        let now = LocalTime::now().to_value();
+        let now = LocalTime::now();
 
         for item in list.iter() {
-            let params = vec_value![item.1, item.2.to_value(), now,
-                    item.0.to_value()];
+            let params = vec_value![item.1, item.2, now, item.0];
             gensql::log_sql_params(&sql, &params);
-            conn.exec_drop(&sql, Params::Positional(params)).await?;
+            conn.exec_sql(&sql, params).await?;
         }
 
         Ok(())
@@ -265,9 +235,9 @@ impl SysPermission {
         let now = LocalTime::now();
 
         for item in list.iter() {
-            let params = vec_value![item.1.to_value(), now, item.0.to_value()];
+            let params = vec_value![item.1, now, item.0];
             gensql::log_sql_params(&sql, &params);
-            conn.exec_drop(&sql, Params::Positional(params)).await?;
+            conn.exec_sql(&sql, params).await?;
         }
 
         Ok(())
@@ -282,9 +252,9 @@ impl SysPermission {
         let now = LocalTime::now();
 
         for item in list.iter() {
-            let params = vec_value![item.1.to_value(), now, item.0.to_value()];
+            let params = vec_value![item.1, now, item.0];
             gensql::log_sql_params(&sql, &params);
-            conn.exec_drop(&sql, Params::Positional(params)).await?;
+            conn.exec_sql(&sql, params).await?;
         }
 
         Ok(())
@@ -301,37 +271,10 @@ impl SysPermission {
 
         for (role, p) in roles.iter().zip(ps.into_iter()) {
             let params = vec_value![p, now, role.role_id];
-            trans.exec_drop(&sql, Params::Positional(params)).await?;
+            trans.exec_sql(&sql, params).await?;
         }
 
         Ok(())
     }
 
-    fn publish_modified() {
-        tokio::spawn(async {
-            let chan = rmq::make_channel(rmq::ChannelName::ModPermission);
-            let op = rmq::RecChanged::<SysPermission>::publish_all(&chan).await;
-            if let Err(e) = op {
-                log::error!("redis发布消息失败: {e:?}");
-            }
-
-            let chan = rmq::make_channel(rmq::ChannelName::ModApi);
-            let op = rmq::RecChanged::<SysApi>::publish_all(&chan).await;
-            if let Err(e) = op {
-                log::error!("redis发布消息失败: {e:?}");
-            }
-
-            let chan = rmq::make_channel(rmq::ChannelName::ModRole);
-            let op = rmq::RecChanged::<SysRole>::publish_all(&chan).await;
-            if let Err(e) = op {
-                log::error!("redis发布消息失败: {e:?}");
-            }
-
-            let chan = rmq::make_channel(rmq::ChannelName::ModMenu);
-            let op = rmq::RecChanged::<SysMenu>::publish_all(&chan).await;
-            if let Err(e) = op {
-                log::error!("redis发布消息失败: {e:?}");
-            }
-        });
-    }
 }

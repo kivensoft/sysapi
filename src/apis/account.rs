@@ -46,7 +46,7 @@ pub async fn profile(ctx: HttpContext) -> HttpResult {
     }
 
     let user_id = ctx.uid();
-    let sys_user = match SysUser::select_by_id(user_id).await? {
+    let sys_user = match SysUser::select_by_id(&user_id).await? {
         Some(v) => v,
         None => return Resp::fail(&format_compact!("账号已被删除")),
     };
@@ -77,13 +77,13 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
     }
 
     let user_id = ctx.uid();
-    let sys_user = match SysUser::select_by_id(user_id).await? {
+    let sys_user = match SysUser::select_by_id(&user_id).await? {
         Some(v) => v,
         None => return Resp::fail(&format_compact!("用户[{user_id}]不存在")),
     };
 
     let role_id = sys_user.role_id.unwrap();
-    let sys_role = match SysRole::select_by_id(role_id).await? {
+    let sys_role = match SysRole::select_by_id(&role_id).await? {
         Some(v) => v,
         None => return Resp::fail(&format_compact!("角色[{role_id}]不存在")),
     };
@@ -134,7 +134,7 @@ pub async fn change_password(ctx: HttpContext) -> HttpResult {
 
     let user_id = ctx.uid();
     let param: Req = ctx.into_json().await?;
-    let sys_user = match SysUser::select_by_id(user_id).await? {
+    let sys_user = match SysUser::select_by_id(&user_id).await? {
         Some(v) => v,
         None => return Resp::fail(&format_compact!("用户[{user_id}]不存在")),
     };

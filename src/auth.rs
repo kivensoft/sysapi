@@ -76,15 +76,16 @@ impl httpserver::HttpMiddleware for Authentication {
 
         if auth(ctx.uid(), ctx.req.uri().path()).await {
             next.run(ctx).await
-        } else {
-            if ctx.uid() == 0 {
-                log::trace!("权限校验失败[{}], 用户尚未登录", ctx.req.uri().path());
-                Resp::fail_with_status(StatusCode::UNAUTHORIZED, 401, "Unauthorized")
-            } else {
-                log::trace!("权限校验失败[{}], 当前用户没有访问权限", ctx.req.uri().path());
-                Resp::fail_with_status(StatusCode::FORBIDDEN, 403, "Forbidden")
-            }
         }
+        else if ctx.uid() == 0 {
+            log::trace!("权限校验失败[{}], 用户尚未登录", ctx.req.uri().path());
+            Resp::fail_with_status(StatusCode::UNAUTHORIZED, 401, "Unauthorized")
+        }
+        else {
+            log::trace!("权限校验失败[{}], 当前用户没有访问权限", ctx.req.uri().path());
+            Resp::fail_with_status(StatusCode::FORBIDDEN, 403, "Forbidden")
+        }
+
     }
 }
 

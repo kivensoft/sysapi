@@ -123,8 +123,7 @@ pub async fn load_config(cfg_name: &str) -> Result<Vec<CfgItem>> {
         )
         .await
         .context(CFG_ACTION)?
-        .map(|res| res.config)
-        .flatten()
+        .and_then(|res| res.config)
         .unwrap_or_else(|| Vec::with_capacity(0));
 
     Ok(res)

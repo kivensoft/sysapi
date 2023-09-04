@@ -13,74 +13,6 @@ use crate::AppConf;
 
 use super::rcache;
 
-pub enum ChannelName {
-    ModApi,
-    ModConfig,
-    ModDict,
-    ModPermission,
-    ModRole,
-    ModUser,
-    ModMenu,
-}
-
-#[derive(Serialize_repr, Deserialize_repr, PartialEq, Clone, Debug)]
-#[repr(u8)]
-pub enum RecordChangedType {
-    All,
-    Insert,
-    Update,
-    Delete,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct RecChanged<T> {
-    #[serde(rename = "type")]
-    change_type: RecordChangedType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<T>,
-}
-
-impl <T: Serialize> RecChanged<T> {
-    #[allow(dead_code)]
-    pub async fn publish_all(channel: &str) -> Result<()> {
-        publish(channel, &serde_json::to_string(&Self {
-            change_type: RecordChangedType::All,
-            data: None,
-        })?).await
-    }
-
-    #[allow(dead_code)]
-    pub async fn publish_insert(channel: &str, data: T) -> Result<()> {
-        publish(channel, &serde_json::to_string(&Self {
-            change_type: RecordChangedType::Insert,
-            data: Some(data),
-        })?).await
-    }
-
-    #[allow(dead_code)]
-    pub async fn publish_update(channel: &str, data: T) -> Result<()> {
-        publish(channel, &serde_json::to_string(&Self {
-            change_type: RecordChangedType::Update,
-            data: Some(data),
-        })?).await
-    }
-
-    #[allow(dead_code)]
-    pub async fn publish_delete(channel: &str, data: T) -> Result<()> {
-        publish(channel, &serde_json::to_string(&Self {
-            change_type: RecordChangedType::Delete,
-            data: Some(data),
-        })?).await
-    }
-
-}
-
-static mut SUB_DATA: Option<Mutex<PubSub>> = None;
-static mut MSG_MAP: Option<Mutex<MessageMap>> = None;
-static mut SUB_DATA_TX: Option<mpsc::UnboundedSender<bool>> = None;
-static mut SUB_DATA_RX: Option<mpsc::UnboundedReceiver<bool>> = None;
-static SUB_DATA_INIT: OnceCell<bool> = OnceCell::const_new();
-
 macro_rules! get_global_value {
     ($e: expr) => {
         unsafe {
@@ -93,30 +25,38 @@ macro_rules! get_global_value {
     };
 }
 
+pub enum ChannelName {
+    ModApi,
+    ModConfig,
+    ModDict,
+    ModPermission,
+    ModRole,
+    ModUser,
+    ModMenu,
+    Login,
+    Logout,
+}
+
+#[derive(Serialize_repr, Deserialize_repr, PartialEq, Clone, Debug)]
+#[repr(u8)]
+pub enum RecordChangedType {
+    All,
+    Insert,
+    Update,
+    Delete,
+}
+
 #[async_trait::async_trait]
 pub trait RedisOnMessage: Send + Sync + 'static {
     async fn handle(&self, msg: Msg) -> Result<()>;
 }
 
-#[async_trait::async_trait]
-impl<FN: Send + Sync + 'static, Fut> RedisOnMessage for FN
-where
-    FN: Fn(Msg) -> Fut,
-    Fut: std::future::Future<Output = Result<()>> + Send + 'static, {
-
-    async fn handle(&self, msg: Msg) -> Result<()> {
-        self(msg).await
-    }
-}
-
-type FuncMap = HashMap<CompactString, Box<dyn RedisOnMessage>>;
-
-struct MessageMap {
-    // MessageMap对象修改标志
-    // 用于消除异步中多次调用subscribe订阅造成反复注册的操作
-    modified: bool,
-    funcs: FuncMap,
-    pfuncs: FuncMap,
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RecChanged<T: Serialize> {
+    #[serde(rename = "type")]
+    change_type: RecordChangedType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<T>,
 }
 
 /// 订阅消息, 当末尾为'*'时, 表示通配符模式订阅. 相同的频道只能被订阅1次,
@@ -196,10 +136,8 @@ pub async fn unsubscribe(channel: &str) -> Result<()> {
         if msg_map.pfuncs.remove(channel).is_some() {
             msg_map.modified = true;
         }
-    } else {
-        if msg_map.funcs.remove(channel).is_some() {
-            msg_map.modified = true;
-        }
+    } else if msg_map.funcs.remove(channel).is_some() {
+        msg_map.modified = true;
     }
 
     if msg_map.modified {
@@ -222,18 +160,6 @@ pub async fn already_subscribe(channel: &str) -> bool {
     }
 }
 
-pub async fn publish(channel: &str, message: &str) -> Result<()> {
-    let mut conn = rcache::get_conn().await?;
-    let cmd = Cmd::publish(channel, message);
-    match cmd.query_async(&mut conn).await {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            log::error!("redis publish error: {e:?}");
-            anyhow::bail!("系统内部错误, 发布消息操作失败")
-        }
-    }
-}
-
 /// 生成订阅频道(使用统一的应用前缀)
 ///
 /// Arguments:
@@ -253,9 +179,106 @@ pub fn make_channel(sub_channel: ChannelName) -> CompactString {
         ChannelName::ModRole       => "modified:role",
         ChannelName::ModUser       => "modified:user",
         ChannelName::ModMenu       => "modified:menu",
+        ChannelName::Login         => "event.login",
+        ChannelName::Logout        => "event.logout",
     };
 
     format_compact!("{}:{}", AppConf::get().cache_pre, sub_channel)
+}
+
+#[allow(dead_code)]
+pub async fn publish(channel: &str, message: &str) -> Result<()> {
+    let mut conn = rcache::get_conn().await?;
+    let cmd = Cmd::publish(channel, message);
+    match cmd.query_async(&mut conn).await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            log::error!("redis publish error: {e:?}");
+            anyhow::bail!("系统内部错误, 发布消息操作失败")
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn publish_rec_change_spawm<T>(chan: ChannelName,
+    change_type: RecordChangedType, value: T)
+where
+    T: Serialize + Send + 'static,
+{
+    tokio::spawn(async move {
+        let chan = make_channel(chan);
+
+        let msg = serde_json::to_string(&RecChanged {
+            change_type,
+            data: Some(value),
+        }).expect("json序列化失败");
+
+        if let Err(e) = publish(&chan, &msg).await {
+            log::error!("redis发布消息失败: {e:?}");
+        }
+    });
+}
+
+impl <T: Serialize> RecChanged<T> {
+    #[allow(dead_code)]
+    pub async fn publish_all(channel: &str) -> Result<()> {
+        publish(channel, &serde_json::to_string(&Self {
+            change_type: RecordChangedType::All,
+            data: None,
+        })?).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn publish_insert(channel: &str, data: T) -> Result<()> {
+        publish(channel, &serde_json::to_string(&Self {
+            change_type: RecordChangedType::Insert,
+            data: Some(data),
+        })?).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn publish_update(channel: &str, data: T) -> Result<()> {
+        publish(channel, &serde_json::to_string(&Self {
+            change_type: RecordChangedType::Update,
+            data: Some(data),
+        })?).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn publish_delete(channel: &str, data: T) -> Result<()> {
+        publish(channel, &serde_json::to_string(&Self {
+            change_type: RecordChangedType::Delete,
+            data: Some(data),
+        })?).await
+    }
+
+}
+
+static mut SUB_DATA: Option<Mutex<PubSub>> = None;
+static mut MSG_MAP: Option<Mutex<MessageMap>> = None;
+static mut SUB_DATA_TX: Option<mpsc::UnboundedSender<bool>> = None;
+static mut SUB_DATA_RX: Option<mpsc::UnboundedReceiver<bool>> = None;
+static SUB_DATA_INIT: OnceCell<bool> = OnceCell::const_new();
+
+#[async_trait::async_trait]
+impl<FN: Send + Sync + 'static, Fut> RedisOnMessage for FN
+where
+    FN: Fn(Msg) -> Fut,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static, {
+
+    async fn handle(&self, msg: Msg) -> Result<()> {
+        self(msg).await
+    }
+}
+
+type FuncMap = HashMap<CompactString, Box<dyn RedisOnMessage>>;
+
+struct MessageMap {
+    // MessageMap对象修改标志
+    // 用于消除异步中多次调用subscribe订阅造成反复注册的操作
+    modified: bool,
+    funcs: FuncMap,
+    pfuncs: FuncMap,
 }
 
 fn gen_url(ac: &AppConf) -> String {
@@ -318,10 +341,10 @@ async fn msg_loop() {
                 // 收到停止订阅消息, false表示订阅频道有变化, 需要重新订阅, true表示停止订阅
                 Some(flag) = rx.recv() =>
                     if flag {
-                        log::trace!("中断redis消息订阅处理");
+                        log::trace!("结束redis消息订阅处理");
                         return;
                     } else {
-                        log::trace!("取消redis所有订阅");
+                        log::trace!("暂停redis消息处理");
                         break;
                     },
             };
@@ -347,6 +370,8 @@ async fn subscribe_by_map(sub_data_lock: &mut MutexGuard<'_, PubSub>) -> Result<
             log::trace!("订阅redis消息: {key}")
         }
         msg_map.modified = false;
+    } else {
+        log::trace!("所有频道均已订阅, 无需再次订阅")
     }
 
     Ok(())

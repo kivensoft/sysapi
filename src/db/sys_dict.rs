@@ -1,15 +1,12 @@
 use anyhow::Result;
 use compact_str::format_compact;
-use gensql::table_define;
+use gensql::{table_define, Transaction, get_conn, query_one_sql, query_all_sql, Queryable};
 use localtime::LocalTime;
-use mysql_async::{prelude::Queryable, TxOpts, Transaction};
-
-use crate::services::rmq;
 
 use super::{PageData, PageInfo};
 
 pub enum DictType {
-    _DictType,
+    _DictClass,
     PermissionGroup,
     _ClientType,
 }
@@ -23,26 +20,6 @@ table_define!("t_sys_dict", SysDict,
 );
 
 impl SysDict {
-    /// 删除记录
-    pub async fn delete_by_id(id: u32) -> Result<u32> {
-        super::exec_sql(&Self::stmt_delete(&id)).await
-    }
-
-    /// 插入记录，返回(插入记录数量, 自增ID的值)
-    pub async fn insert(value: &SysDict) -> Result<(u32, u32)> {
-        super::insert_sql(&Self::stmt_insert(value)).await
-    }
-
-    /// 更新记录
-    pub async fn update_by_id(value: &SysDict) -> Result<u32> {
-        super::exec_sql(&Self::stmt_update(value)).await
-    }
-
-    /// 查询记录
-    pub async fn select_by_id(id: u32) -> Result<Option<SysDict>> {
-        Ok(super::query_one_sql(&Self::stmt_select(&id)).await?.map(Self::row_map))
-    }
-
     /// 查询记录
     pub async fn select_page(value: &SysDict, page: PageInfo) -> Result<PageData<SysDict>> {
         let (tsql, psql, params) = gensql::SelectSql::with_page(page.index, page.size)
@@ -55,34 +32,34 @@ impl SysDict {
             .end_where()
             .build_with_page()?;
 
-        let mut conn = super::get_conn().await?;
+        let mut conn = get_conn().await?;
 
         let total = if tsql.is_empty() {
             0
         } else {
-            conn.exec_first(tsql, params.clone()).await?.map(|(total,)| total).unwrap_or(0)
+            conn.query_one_sql(tsql, params.clone()).await?.map(|(total,)| total).unwrap_or(0)
         };
 
-        let list = conn.exec_map(psql, params, Self::row_map).await?;
+        let list = conn.query_all_sql(psql, params, Self::row_map).await?;
 
         Ok(PageData { total, list, })
     }
 
     /// 返回指定类型的所有字典项
     pub async fn select_by_type(dict_type: u16) -> Result<Vec<SysDict>> {
-        let sql_params = gensql::SelectSql::new()
+        let (sql, params) = gensql::SelectSql::new()
             .select_slice("", &Self::fields())
             .from(Self::TABLE)
             .where_sql()
             .and_eq("", Self::DICT_TYPE, &dict_type)
             .end_where()
             .build();
-        super::query_all_sql(&sql_params, Self::row_map).await
+        query_all_sql(&sql, &params, Self::row_map).await
     }
 
     /// 查询指定类型的dict_code最大值
     pub async fn select_max_code(dict_type: u16) -> Result<Option<u16>> {
-        let sql_params = gensql::SelectSql::new()
+        let (sql, params) = gensql::SelectSql::new()
             .select(&format_compact!("max({})", Self::DICT_CODE))
             .from(Self::TABLE)
             .where_sql()
@@ -90,7 +67,7 @@ impl SysDict {
             .end_where()
             .build();
 
-        Ok(super::query_one_sql(&sql_params).await?)
+        query_one_sql(&sql, &params).await
     }
 
     // 批量更新指定的类别(使用事务进行更新)
@@ -104,8 +81,8 @@ impl SysDict {
             ..Default::default()
         };
 
-        let mut conn = super::get_conn().await?;
-        let mut conn = conn.start_transaction(TxOpts::new()).await?;
+        let mut conn = get_conn().await?;
+        let mut conn = conn.start_transaction().await?;
         let trans = &mut conn;
 
         // 更新已存在的记录
@@ -136,14 +113,6 @@ impl SysDict {
 
         conn.commit().await?;
 
-        tokio::spawn(async move {
-            let chan = rmq::make_channel(rmq::ChannelName::ModDict);
-            let op = rmq::RecChanged::<SysDict>::publish_all(&chan).await;
-            if let Err(e) = op {
-                log::error!("redis发布消息失败: {e:?}");
-            }
-        });
-
         Ok(())
     }
 
@@ -155,7 +124,7 @@ impl SysDict {
         dict.dict_name = name;
 
         let (sql, params) = Self::stmt_update_dynamic(dict);
-        conn.exec_drop(sql, params).await?;
+        conn.exec_sql(sql, params).await?;
         Ok(())
     }
 
@@ -166,13 +135,13 @@ impl SysDict {
         dict.dict_name = Some(name.to_owned());
 
         let (sql, params) = Self::stmt_insert(dict);
-        conn.exec_drop(sql, params).await?;
+        conn.exec_sql(sql, params).await?;
         Ok(())
     }
 
     async fn my_delete_dict(conn: &mut Transaction<'_>, id: u32) -> Result<()> {
         let (sql, params) = Self::stmt_delete(&id);
-        conn.exec_drop(sql, params).await?;
+        conn.exec_sql(sql, params).await?;
         Ok(())
     }
 

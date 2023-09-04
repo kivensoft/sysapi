@@ -21,7 +21,8 @@ const BANNER: &str = r#"
 "#;
 
 const APP_NAME: &str = "sysapi";
-const APP_VER: &str = "0.7.1";
+/// app版本号, 来自编译时由build.rs从cargo.toml中读取的版本号(读取内容写入.version文件)
+const APP_VER: &str = include_str!(concat!(env!("OUT_DIR"), "/.version"));
 
 appconfig::appglobal_define!(app_global, AppGlobal,
     startup_time: i64,
@@ -324,16 +325,20 @@ fn main() {
 
     let async_fn = async move {
         // 加载远程配置
-        load_remote_config(ac).await.expect("加载远程配置失败");
-        ag.jwt_ttl = ac.jwt_ttl.parse::<u32>().expect("远程配置jwt-ttl格式错误") * 60;
+        if let Err(e) = load_remote_config(ac).await {
+            log::error!("加载远程配置失败: {e:?}");
+            log::debug!("使用本地配置启动服务...");
+        }
+        ag.jwt_ttl = ac.jwt_ttl.parse::<u32>().expect("配置jwt-ttl格式错误") * 60;
         log::trace!("配置: {ac:#?}");
 
         // 初始化数据库连接和缓存连接
         services::rcache::init_pool(ac).expect("初始化缓存连接失败");
-        db::init_pool(ac).expect("初始化数据库连接失败");
+        gensql::init_pool(&ac.db_name, &ac.db_pass, &ac.db_host, &ac.db_port,
+            &ac.db_name).expect("初始化数据库连接失败");
 
         // 测试数据库连接是否正确
-        db::try_connect().await.unwrap();
+        gensql::try_connect().await.unwrap();
 
         // 启动服务注册心跳任务
         tokio::spawn(rpc::start_heart_break_task(reg_interval));

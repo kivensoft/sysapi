@@ -29,7 +29,7 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
     type Req = super::GetReq;
 
     let param: Req = ctx.into_json().await?;
-    let rec = SysMenu::select_by_id(param.id).await;
+    let rec = SysMenu::select_by_id(&param.id).await;
 
     match check_result!(rec) {
         Some(rec) => Resp::ok(&rec),
@@ -80,16 +80,13 @@ pub async fn post(ctx: HttpContext) -> HttpResult {
         None => SysMenu::insert(&param.inner).await.map(|(_, id)| id),
     });
 
-    tokio::spawn(async move {
-        let msg = SysMenu { menu_id: Some(id), ..Default::default() };
-        let chan = rmq::make_channel(rmq::ChannelName::ModMenu);
-        let op = match param.inner.menu_id {
-            Some(_) => rmq::RecChanged::publish_update(&chan, msg).await,
-            None => rmq::RecChanged::publish_insert(&chan, msg).await,
-        };
-        if let Err(e) = op {
-            log::error!("redis发布消息失败: {e:?}");
-        }
+    let typ = match param.inner.menu_id {
+        Some(_) => rmq::RecordChangedType::Update,
+        None => rmq::RecordChangedType::Insert,
+    };
+    rmq::publish_rec_change_spawm(rmq::ChannelName::ModMenu, typ, SysMenu {
+        menu_id: Some(id),
+        ..Default::default()
     });
 
     Resp::ok( &Res {
@@ -103,19 +100,16 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
     type Req = super::GetReq;
 
     let param: Req = ctx.into_json().await?;
-    let op = SysMenu::delete_by_id(param.id).await;
+    let op = SysMenu::delete_by_id(&param.id).await;
     check_result!(op);
 
-    tokio::spawn(async move {
-        let chan = rmq::make_channel(rmq::ChannelName::ModMenu);
-        let op = rmq::RecChanged::publish_delete(&chan, SysMenu {
+    rmq::publish_rec_change_spawm(rmq::ChannelName::ModMenu,
+        rmq::RecordChangedType::Delete,
+        SysMenu {
             menu_id: Some(param.id),
             ..Default::default()
-        }).await;
-        if let Err(e) = op {
-            log::error!("redis发布消息失败: {e:?}");
         }
-    });
+    );
 
     Resp::ok_with_empty()
 }
@@ -160,9 +154,7 @@ pub async fn tree(ctx: HttpContext) -> HttpResult {
         menu_map.entry(parent_code)
             .and_modify(|v| v.push(item))
             .or_insert_with(|| {
-                let mut vec = Vec::new();
-                vec.push(item);
-                vec
+                vec![item]
             });
     }
 
@@ -176,7 +168,7 @@ pub async fn tree(ctx: HttpContext) -> HttpResult {
     build_tree(&mut top_menu, &menu_map)?;
 
 
-    Resp::ok(&Res { menus: top_menu.menus.unwrap_or_else(Vec::new) })
+    Resp::ok(&Res { menus: top_menu.menus.unwrap_or_default() })
 }
 
 /// 重新排序权限
@@ -189,8 +181,9 @@ pub async fn rearrange(ctx: HttpContext) -> HttpResult {
     tree_to_list(&mut list, "", &param);
     check_result!(SysMenu::batch_update_rearrange(&list).await);
 
-    let chan = rmq::make_channel(rmq::ChannelName::ModMenu);
-    rmq::RecChanged::<SysMenu>::publish_all(&chan).await?;
+    rmq::publish_rec_change_spawm::<Option<()>>(rmq::ChannelName::ModMenu,
+        rmq::RecordChangedType::All, None);
+
 
     Resp::ok_with_empty()
 }

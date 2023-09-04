@@ -63,14 +63,14 @@ pub fn rand_password(len: usize) -> String {
     }
 
     let mut pos = usize::MAX;
-    for i in 1..4 {
+    for item in CHS.iter().skip(1) {
         pos = loop {
-            let p = rng.gen_range(0..CHS[i].len());
+            let p = rng.gen_range(0..item.len());
             if p != pos {
                 break p;
             }
         };
-        cs[pos] = CHS[i][pos];
+        cs[pos] = item[pos];
     }
 
     unsafe { String::from_utf8_unchecked(cs) }

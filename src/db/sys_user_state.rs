@@ -10,24 +10,5 @@ table_define!("t_sys_user_state", SysUserState,
 );
 
 impl SysUserState {
-    /// 删除记录
-    pub async fn delete_by_id(id: u32) -> Result<u32> {
-        super::exec_sql(&Self::stmt_delete(&id)).await
-    }
-
-    /// 插入记录，返回(插入记录数量, 自增ID的值)
-    pub async fn insert(value: &SysUserState) -> Result<(u32, u32)> {
-        super::insert_sql(&Self::stmt_insert(value)).await
-    }
-
-    /// 更新记录
-    pub async fn update_by_id(value: &SysUserState) -> Result<u32> {
-        super::exec_sql(&Self::stmt_update(value)).await
-    }
-
-    /// 查询记录
-    pub async fn select_by_id(id: u32) -> Result<Option<SysUserState>> {
-        Ok(super::query_one_sql(&Self::stmt_select(&id)).await?.map(Self::row_map))
-    }
 
 }

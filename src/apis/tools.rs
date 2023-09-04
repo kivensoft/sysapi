@@ -39,17 +39,19 @@ pub async fn ping(ctx: HttpContext) -> HttpResult {
 }
 
 /// 服务状态
-pub async fn status(_ctx: HttpContext) -> HttpResult {
+pub async fn status(ctx: HttpContext) -> HttpResult {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Res {
-        startup: LocalTime,
+        startup: LocalTime, // 服务启动时间
+        responses: u32, // 总相应次数
     }
 
     let app_global = AppGlobal::get();
 
     Resp::ok(&Res {
         startup: LocalTime::from_unix_timestamp(app_global.startup_time),
+        responses: ctx.id(),
     })
 }
 

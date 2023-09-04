@@ -20,7 +20,7 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
     type Req = super::GetReq;
 
     let param: Req = ctx.into_json().await?;
-    let rec = SysDict::select_by_id(param.id).await;
+    let rec = SysDict::select_by_id(&param.id).await;
 
     match check_result!(rec) {
         Some(rec) => Resp::ok(&rec),
@@ -50,16 +50,13 @@ pub async fn post(ctx: HttpContext) -> HttpResult {
         None => SysDict::insert(&param).await.map(|(_, id)| id),
     });
 
-    tokio::spawn(async move {
-        let msg = SysDict { dict_id: Some(id), ..Default::default() };
-        let chan = rmq::make_channel(rmq::ChannelName::ModDict);
-        let op = match param.dict_id {
-            Some(_) => rmq::RecChanged::publish_update(&chan, msg).await,
-            None => rmq::RecChanged::publish_insert(&chan, msg).await,
-        };
-        if let Err(e) = op {
-            log::error!("redis发布消息失败: {e:?}");
-        }
+    let typ = match param.dict_id {
+        Some(_) => rmq::RecordChangedType::Update,
+        None => rmq::RecordChangedType::Insert,
+    };
+    rmq::publish_rec_change_spawm(rmq::ChannelName::ModDict, typ, SysDict {
+        dict_id: Some(id),
+        ..Default::default()
     });
 
 
@@ -74,19 +71,16 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
     type Req = super::GetReq;
 
     let param: Req = ctx.into_json().await?;
-    let r = SysDict::delete_by_id(param.id).await;
+    let r = SysDict::delete_by_id(&param.id).await;
     check_result!(r);
 
-    tokio::spawn(async move {
-        let chan = rmq::make_channel(rmq::ChannelName::ModDict);
-        let op = rmq::RecChanged::publish_delete(&chan, SysDict {
+    rmq::publish_rec_change_spawm(rmq::ChannelName::ModDict,
+        rmq::RecordChangedType::Delete,
+        SysDict {
             dict_id: Some(param.id),
             ..Default::default()
-        }).await;
-        if let Err(e) = op {
-            log::error!("redis发布消息失败: {e:?}");
         }
-    });
+    );
 
     Resp::ok_with_empty()
 }
@@ -123,6 +117,9 @@ pub async fn batch(ctx: HttpContext) -> HttpResult {
 
     let param: Req = ctx.into_json().await?;
     check_result!(SysDict::batch_update_by_type(param.dict_type, &param.dict_names).await);
+
+    rmq::publish_rec_change_spawm::<Option<()>>(rmq::ChannelName::ModDict,
+        rmq::RecordChangedType::All, None,);
 
     Resp::ok_with_empty()
 }

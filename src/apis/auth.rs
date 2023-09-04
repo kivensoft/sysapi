@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use crate::{
     AppConf, AppGlobal, auth,
     db::{sys_user::SysUser, sys_user_state::SysUserState},
-    services::rcache,
+    services::{rcache, rmq},
     utils,
 };
 use anyhow::Result;
@@ -62,6 +62,18 @@ pub async fn login(ctx: HttpContext) -> HttpResult {
     let expire = (utils::time::unix_timestamp() + AppGlobal::get().jwt_ttl as u64) as i64;
     let expire = LocalTime::from_unix_timestamp(expire);
 
+    tokio::spawn(async move {
+        let chan = rmq::make_channel(rmq::ChannelName::Login);
+        let msg = serde_json::to_string(&SysUser {
+                user_id: Some(user_id),
+                ..Default::default()
+            }).expect("json序列化失败");
+
+        if let Err(e) = rmq::publish(&chan, &msg).await {
+            log::error!("发送登录消息失败: {e:?}");
+        }
+    });
+
     Resp::ok(&Res { token, key, expire, user_id })
 }
 
@@ -71,6 +83,18 @@ pub async fn logout(ctx: HttpContext) -> HttpResult {
 
     let key = gen_invlid_key(token)?;
     rcache::set(&key, "1", AppGlobal::get().jwt_ttl as usize).await?;
+
+    tokio::spawn(async move {
+        let chan = rmq::make_channel(rmq::ChannelName::Logout);
+        let msg = serde_json::to_string(&SysUser {
+                user_id: Some(ctx.uid()),
+                ..Default::default()
+            }).expect("json序列化失败");
+
+        if let Err(e) = rmq::publish(&chan, &msg).await {
+            log::error!("发送退出消息失败: {e:?}");
+        }
+    });
 
     Resp::ok_with_empty()
 }
@@ -89,7 +113,7 @@ pub async fn refresh(ctx: HttpContext) -> HttpResult {
     let param: Req = ctx.into_json().await?;
 
     // 加载当前登录用户信息
-    let user = match SysUser::select_by_id(user_id).await? {
+    let user = match SysUser::select_by_id(&user_id).await? {
         Some(user) => user,
         None => return Resp::fail("用户不存在"),
     };
@@ -174,11 +198,11 @@ pub async fn authenticate(ctx: HttpContext) -> HttpResult {
         statuses.push(status);
     }
 
-    return Resp::ok(&Res {
+    Resp::ok(&Res {
         user_id,
         status: None,
         statuses: Some(statuses),
-    });
+    })
 }
 
 /// 生成token
@@ -306,7 +330,7 @@ async fn update_login_state(account: &str, user_id: u32, ip: Ipv4Addr) -> Result
     let ip = ip.to_string();
     let now = LocalTime::now();
 
-    match SysUserState::select_by_id(user_id).await? {
+    match SysUserState::select_by_id(&user_id).await? {
         Some(mut val) => {
             val.total_login = Some(val.total_login.unwrap() + 1);
             val.last_login_time = Some(now);

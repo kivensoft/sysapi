@@ -23,7 +23,7 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
     type Req = super::GetReq;
 
     let param: Req = ctx.into_json().await?;
-    let rec = SysApi::select_by_id(param.id).await;
+    let rec = SysApi::select_by_id(&param.id).await;
 
     match check_result!(rec) {
         Some(rec) => Resp::ok(&rec),
@@ -69,7 +69,7 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
     type Req = super::GetReq;
 
     let param: Req = ctx.into_json().await?;
-    let r = SysApi::delete_by_id(param.id).await;
+    let r = SysApi::delete_by_id(&param.id).await;
     check_result!(r);
 
     tokio::spawn(async move {

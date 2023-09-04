@@ -1,7 +1,6 @@
 use anyhow::Result;
-use gensql::{table_define, vec_value};
+use gensql::{table_define, get_conn, query_all_sql, vec_value, Queryable};
 use localtime::LocalTime;
-use mysql_async::{prelude::Queryable, TxOpts, Params};
 use serde::{Serialize, Deserialize};
 
 use crate::{db::sys_dict::SysDict, services::rmq};
@@ -26,26 +25,6 @@ pub struct SysApiExt {
 }
 
 impl SysApi {
-    /// 删除记录
-    pub async fn delete_by_id(id: u32) -> Result<u32> {
-        super::exec_sql(&Self::stmt_delete(&id)).await
-    }
-
-    /// 插入记录，返回(插入记录数量, 自增ID的值)
-    pub async fn insert(value: &SysApi) -> Result<(u32, u32)> {
-        super::insert_sql(&Self::stmt_insert(value)).await
-    }
-
-    /// 更新记录
-    pub async fn update_by_id(value: &SysApi) -> Result<u32> {
-        super::exec_sql(&Self::stmt_update(value)).await
-    }
-
-    /// 查询记录
-    pub async fn select_by_id(id: u32) -> Result<Option<SysApi>> {
-        Ok(super::query_one_sql(&Self::stmt_select(&id)).await?.map(Self::row_map))
-    }
-
     /// 查询记录
     pub async fn select_page(value: &SysApiExt, page: PageInfo) -> Result<PageData<SysApiExt>> {
         use compact_str::format_compact as fmt;
@@ -80,15 +59,15 @@ impl SysApi {
             .end_where()
             .build_with_page()?;
 
-        let mut conn = super::get_conn().await?;
+        let mut conn = get_conn().await?;
 
         let total = if tsql.is_empty() {
             0
         } else {
-            conn.exec_first(tsql, params.clone()).await?.map(|(total,)| total).unwrap_or(0)
+            conn.query_one_sql(&tsql, &params).await?.map(|(total,)| total).unwrap_or(0)
         };
 
-        let list = conn.exec_map(psql, params, |(
+        let list = conn.query_all_sql(psql, params, |(
                 api_id,
                 permission_code,
                 api_path,
@@ -111,17 +90,17 @@ impl SysApi {
 
     /// 加载所有记录
     pub async fn select_all() -> Result<Vec<SysApi>> {
-        let sql_params = gensql::SelectSql::new()
+        let (sql, params) = gensql::SelectSql::new()
             .select_slice("", &Self::fields())
             .from(Self::TABLE)
             .build();
-        super::query_all_sql(&sql_params, Self::row_map).await
+        query_all_sql(&sql, &params, Self::row_map).await
     }
 
     /// 批量更新列表中的权限索引值, 更新失败则回滚
     pub async fn batch_update_permission_id(value: &[SysApi]) -> Result<()> {
-        let mut conn = super::get_conn().await?;
-        let mut conn = conn.start_transaction(TxOpts::new()).await?;
+        let mut conn = get_conn().await?;
+        let mut conn = conn.start_transaction().await?;
 
         type T = SysApi;
         let sql = format!("update {} set {} = ?, {} = ? where {} = ?",
@@ -135,7 +114,7 @@ impl SysApi {
             ];
 
             gensql::log_sql_params(&sql, &params);
-            conn.exec_drop(&sql, &Params::Positional(params)).await?;
+            conn.exec_sql(&sql, &params).await?;
         }
 
         conn.commit().await?;
