@@ -156,6 +156,7 @@ fn init() -> Option<(&'static mut AppConf, &'static mut AppGlobal)> {
 
     // 在控制台输出logo
     if let Some((s1, s2)) = BANNER.split_once('%') {
+        let s2 = &s2[s2.len() - 1..];
         buf.clear();
         write!(buf, "{s1}{APP_VER}{s2}").unwrap();
         appconfig::print_banner(&buf, true);
@@ -322,42 +323,56 @@ fn main() {
     reg_apis(&mut srv);
 
     let reg_interval = ac.reg_interval.parse().unwrap();
+    let have_gateway = !ac.gateway.is_empty();
 
     let async_fn = async move {
         // 加载远程配置
-        if let Err(e) = load_remote_config(ac).await {
-            log::error!("加载远程配置失败: {e:?}");
-            log::debug!("使用本地配置启动服务...");
+        if have_gateway {
+            if let Err(e) = load_remote_config(ac).await {
+                log::error!("加载远程配置失败: {e:?}");
+                log::debug!("使用本地配置启动服务...");
+            }
         }
         ag.jwt_ttl = ac.jwt_ttl.parse::<u32>().expect("配置jwt-ttl格式错误") * 60;
         log::trace!("配置: {ac:#?}");
 
         // 初始化数据库连接和缓存连接
         services::rcache::init_pool(ac).expect("初始化缓存连接失败");
-        gensql::init_pool(&ac.db_name, &ac.db_pass, &ac.db_host, &ac.db_port,
+        gensql::init_pool(&ac.db_user, &ac.db_pass, &ac.db_host, &ac.db_port,
             &ac.db_name).expect("初始化数据库连接失败");
 
         // 测试数据库连接是否正确
-        gensql::try_connect().await.unwrap();
+        gensql::try_connect().await.expect("数据库连接失败");
 
         // 启动服务注册心跳任务
-        tokio::spawn(rpc::start_heart_break_task(reg_interval));
+        if have_gateway {
+            tokio::spawn(rpc::start_heart_break_task(reg_interval));
+        }
 
         // 设置权限校验中间件
         auth::init().await;
         srv.middleware(auth::Authentication);
 
         // 运行http服务
-        tokio::spawn(srv.run_with_callbacck(addr, || async {
-            rpc::reg_to_gateway().await
-        }));
+        tokio::spawn(async move {
+            if let Err(e) = srv.run_with_callbacck(addr, move || async move {
+                if have_gateway {
+                    if let Err(e) = rpc::reg_to_gateway().await {
+                        log::error!("首次向网关注册服务失败: {e:?}");
+                    }
+                }
+                Ok(())
+            }).await {
+                log::error!("启动http服务失败: {e:?}");
+            }
+        });
 
         match signal::ctrl_c().await {
             Ok(()) => {
                 log::info!("关闭{APP_NAME}服务");
             },
-            Err(err) => {
-                eprintln!("Unable to listen for shutdown signal: {}", err);
+            Err(e) => {
+                log::error!("Unable to listen for shutdown signal: {e:?}");
             },
         }
     };

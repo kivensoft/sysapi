@@ -4,6 +4,8 @@ use anyhow::Result;
 use mysql_async::{Pool, prelude::{self, FromRow, StatementLike}, Params, TxOpts};
 
 pub use mysql_common::value::{convert::ToValue, Value};
+use parking_lot::Mutex;
+use triomphe::Arc;
 
 #[async_trait::async_trait]
 pub trait Queryable {
@@ -36,17 +38,14 @@ pub trait Queryable {
 pub struct Conn(mysql_async::Conn);
 pub struct Transaction<'a>(mysql_async::Transaction<'a>);
 
-type DbPool = Option<Pool>;
+type DbPool = Mutex<Option<Arc<Pool>>>;
 
-static DB_POOL: DbPool = None;
+static DB_POOL: DbPool = Mutex::new(None);
 
 /// 从连接池中获取连接
 pub async fn get_conn() -> Result<Conn> {
-    debug_assert!(DB_POOL.is_some());
-    match &DB_POOL {
-        Some(pool) => Ok(Conn(pool.get_conn().await?)),
-        _ => unsafe { std::hint::unreachable_unchecked() },
-    }
+    let c = inner_get_conn().await?;
+    Ok(Conn(c))
 }
 
 // mysql连接测试
@@ -58,15 +57,10 @@ pub async fn try_connect() -> Result<()> {
 
 /// 初始化连接池(必须在程序开始时调用)
 pub fn init_pool(user: &str, pass: &str, host: &str, port: &str, db: &str) -> Result<()> {
-    debug_assert!(DB_POOL.is_none());
-
     let url = format!("mysql://{}:{}@{}:{}/{}", user, pass, host, port, db);
-
-    unsafe {
-        let db_pool = &DB_POOL as *const DbPool as *mut DbPool;
-        *db_pool = Some(Pool::from_url(url)?);
-    }
-
+    let p = Pool::from_url(url)?;
+    let mut db_pool = DB_POOL.lock();
+    *db_pool = Some(Arc::new(p));
     Ok(())
 }
 
@@ -220,9 +214,6 @@ impl Transaction<'_> {
 }
 
 async fn inner_get_conn() -> Result<mysql_async::Conn> {
-    debug_assert!(DB_POOL.is_some());
-    match &DB_POOL {
-        Some(pool) => Ok(pool.get_conn().await?),
-        _ => unsafe { std::hint::unreachable_unchecked() },
-    }
+    let p = DB_POOL.lock().as_ref().unwrap().clone();
+    Ok(p.get_conn().await?)
 }
