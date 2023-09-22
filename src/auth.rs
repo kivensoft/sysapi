@@ -1,6 +1,7 @@
 use anyhow::{Result, Context};
 use base64::{engine::general_purpose, Engine};
 use compact_str::CompactString;
+use cookie::Cookie;
 use httpserver::{HttpContext, Next, Resp, HttpResult};
 use hyper::StatusCode;
 use lru::LruCache;
@@ -12,7 +13,8 @@ use std::{borrow::Cow, collections::HashMap, num::NonZeroUsize};
 
 use crate::{utils, services::rmq, db::{sys_user::SysUser, sys_role::SysRole, sys_api::SysApi}};
 
-const ACCESS_TOKEN: &str = "access_token";
+pub const ACCESS_TOKEN: &str = "access_token";
+pub const COOKIE_NAME: &str = "Cookie";
 const PUBLIC_PERMIT: u32 = u32::MAX;
 const ANONYMOUS_PERMIT: u32 = u32::MAX - 1;
 const API_PATH_PRE: &str = "/api"; // 接口请求的统一路径前缀, 权限判断时忽略该前缀
@@ -197,7 +199,7 @@ pub fn decode_token(token: &str) -> Result<u32> {
     anyhow::bail!("token body format error");
 }
 
-/// 解析返回jwt token字符串
+/// 从url参数或cookie中解析access_token
 fn get_token(ctx: &HttpContext) -> Result<Option<Cow<str>>> {
     match ctx.req.headers().get(jwt::AUTHORIZATION) {
         Some(auth) => match auth.to_str() {
@@ -216,6 +218,7 @@ fn get_token(ctx: &HttpContext) -> Result<Option<Cow<str>>> {
 
 /// 从url参数中解析access_token
 fn get_access_token(ctx: &HttpContext) -> Result<Option<Cow<str>>> {
+    // 优先从url中获取access_token参数
     if let Some(query) = ctx.req.uri().query() {
         let url_params = querystring::querify(query);
         if let Some(param) = url_params.iter().find(|v| v.0 == ACCESS_TOKEN) {
@@ -225,6 +228,23 @@ fn get_access_token(ctx: &HttpContext) -> Result<Option<Cow<str>>> {
             }
         };
     };
+
+    // url中找不到, 尝试从cookie中获取access_token
+    if let Some(cookie_str) = ctx.req.headers().get(COOKIE_NAME) {
+        let cookie_str = match cookie_str.to_str() {
+            Ok(s) => s,
+            Err(e) => anyhow::bail!("cookie value is not utf8 string: {e:?}")
+        };
+        for cookie in Cookie::split_parse_encoded(cookie_str) {
+            match cookie {
+                Ok(c) => if c.name() == ACCESS_TOKEN {
+                    return Ok(Some(Cow::Owned(c.value().to_owned())));
+                },
+                Err(e) => anyhow::bail!("cookie value [{cookie_str}] parse encode error: {e:?}"),
+            }
+        }
+    }
+
     Ok(None)
 }
 

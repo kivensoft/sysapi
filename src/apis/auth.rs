@@ -7,9 +7,10 @@ use crate::{
     services::{rcache, rmq},
     utils,
 };
-use anyhow::Result;
+use anyhow::{Result, Context};
 use base64::{engine::general_purpose, Engine};
 use compact_str::CompactString;
+use cookie::{Cookie, time::Duration};
 use httpserver::{HttpContext, Resp, HttpResult};
 use itoa::Buffer;
 use localtime::LocalTime;
@@ -33,9 +34,11 @@ struct LoginRes {
 /// 用户登录接口
 pub async fn login(ctx: HttpContext) -> HttpResult {
     #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct Req {
         username: CompactString,
         password: CompactString,
+        use_cookie: Option<bool>,
     }
 
     type Res = LoginRes;
@@ -74,7 +77,25 @@ pub async fn login(ctx: HttpContext) -> HttpResult {
         }
     });
 
-    Resp::ok(&Res { token, key, expire, user_id })
+    if param.use_cookie.unwrap_or(false) {
+        let cookie = Cookie::build(auth::ACCESS_TOKEN, token.to_owned())
+            .max_age(Duration::seconds(AppGlobal::get().jwt_ttl as i64))
+            .finish();
+        let body = hyper::Body::from(
+            serde_json::to_vec(&httpserver::ApiResult {
+                code: 200,
+                message: None,
+                data: Some(&Res { token, key, expire, user_id }),
+            })?
+        );
+        Ok(hyper::Response::builder()
+                .header(httpserver::CONTENT_TYPE, httpserver::APPLICATION_JSON)
+                .header("Set-Cookie", cookie.to_string())
+                .body(body).context("response build error")?)
+    } else {
+        Resp::ok(&Res { token, key, expire, user_id })
+    }
+
 }
 
 /// 退出登录
