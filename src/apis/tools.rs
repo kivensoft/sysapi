@@ -18,7 +18,7 @@ pub async fn ping(ctx: HttpContext) -> HttpResult {
     }
 
     #[derive(Serialize)]
-    // #[serde(rename_all = "camelCase")]
+    #[serde(rename_all = "camelCase")]
     struct Res {
         reply: CompactString,
         now: LocalTime,
@@ -29,7 +29,7 @@ pub async fn ping(ctx: HttpContext) -> HttpResult {
         Some(ping_params) => ping_params.reply,
         None => None,
     }
-    .unwrap_or("pong".to_compact_string());
+    .unwrap_or(CompactString::new("pong"));
 
     Resp::ok(&Res {
         reply,

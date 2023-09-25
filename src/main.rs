@@ -23,6 +23,7 @@ const BANNER: &str = r#"
 const APP_NAME: &str = "sysapi";
 /// app版本号, 来自编译时由build.rs从cargo.toml中读取的版本号(读取内容写入.version文件)
 const APP_VER: &str = include_str!(concat!(env!("OUT_DIR"), "/.version"));
+const SERVICE_PREFIX: &str = "/api/sys/";
 
 appconfig::appglobal_define!(app_global, AppGlobal,
     startup_time: i64,
@@ -169,7 +170,7 @@ fn init() -> Option<(&'static mut AppConf, &'static mut AppGlobal)> {
 fn reg_apis(srv: &mut HttpServer) {
     macro_rules! cc {
         ($path:literal) => {
-            concat!("/api/sys/", $path, "/")
+            concat!($path, "/")
         };
     }
 
@@ -252,6 +253,7 @@ fn reg_apis(srv: &mut HttpServer) {
 
     httpserver::register_apis!(srv, cc!("tools"),
         "ping": apis::tools::ping,
+        "ping/*": apis::tools::ping,
         "status": apis::tools::status,
         "ip": apis::tools::ip,
         "qrcode": apis::tools::qrcode,
@@ -318,7 +320,7 @@ fn main() {
 
     let threads = ac.threads.parse::<usize>().expect(arg_err!("threads"));
     let addr: std::net::SocketAddr = ac.listen.parse().expect(arg_err!("listen"));
-    let mut srv = HttpServer::new(true);
+    let mut srv = HttpServer::new(SERVICE_PREFIX, true);
 
     reg_apis(&mut srv);
 

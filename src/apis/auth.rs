@@ -165,9 +165,9 @@ pub async fn authenticate(ctx: HttpContext) -> HttpResult {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Req {
-        user_id: Option<u32>,
+        user_id: Option<u32>,                   // user_id/token两个参数只需提供1个
         token  : Option<String>,
-        path   : Option<CompactString>,
+        path   : Option<CompactString>,         // path/paths两个只需提供1个
         paths  : Option<Vec<CompactString>>,
     }
 
