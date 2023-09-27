@@ -15,9 +15,10 @@ use crate::{utils, services::rmq, db::{sys_user::SysUser, sys_role::SysRole, sys
 
 pub const ACCESS_TOKEN: &str = "access_token";
 pub const COOKIE_NAME: &str = "Cookie";
+pub const API_PATH_PRE: &str = "/api"; // 接口请求的统一路径前缀, 权限判断时忽略该前缀
+
 const PUBLIC_PERMIT: u32 = u32::MAX;
 const ANONYMOUS_PERMIT: u32 = u32::MAX - 1;
-const API_PATH_PRE: &str = "/api"; // 接口请求的统一路径前缀, 权限判断时忽略该前缀
 const USER_ROLE_CACHE_SIZE: Option<NonZeroUsize> = NonZeroUsize::new(128); //USER_ROLE_CACHE的缓存大小
 
 type StaticShare<T> = Option<RwLock<Arc<T>>>;

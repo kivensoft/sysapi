@@ -19,24 +19,31 @@ pub struct PageData<T> {
 pub struct PageInfo {
     pub index: u32,
     pub size: u32,
+    pub total: Option<u32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct PageQuery<T> {
     #[serde(flatten)]
     pub inner: T,
     pub i: u32,
     pub p: u32,
+    pub a: Option<u32>,
 }
 
 impl PageInfo {
     pub fn new() -> Self {
-        Self { index: 0, size: 0 }
+        Self::default()
     }
 
     #[allow(dead_code)]
     pub fn with(index: u32, size: u32) -> Self {
-        Self { index, size }
+        Self { index, size, total: None }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_total(index: u32, size: u32, total: Option<u32>) -> Self {
+        Self { index, size , total }
     }
 }
 
@@ -45,8 +52,8 @@ impl <T> PageQuery<T> {
         &self.inner
     }
 
-    pub fn page(&self) -> PageInfo {
-        PageInfo { index: self.i, size: self.p }
+    pub fn to_page_info(&self) -> PageInfo {
+        PageInfo { index: self.i, size: self.p, total: self.a }
     }
 }
 

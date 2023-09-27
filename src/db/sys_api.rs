@@ -64,7 +64,13 @@ impl SysApi {
         let total = if tsql.is_empty() {
             0
         } else {
-            conn.query_one_sql(&tsql, &params).await?.map(|(total,)| total).unwrap_or(0)
+            match page.total {
+                Some(total) => total,
+                None => conn.query_one_sql(&tsql, &params)
+                        .await?
+                        .map(|(total,)| total)
+                        .unwrap_or(0),
+            }
         };
 
         let list = conn.query_all_sql(psql, params, |(

@@ -5,6 +5,7 @@ mod services;
 mod utils;
 
 use std::fmt::Write;
+use compact_str::format_compact;
 use httpserver::HttpServer;
 use localtime::LocalTime;
 use services::rpc;
@@ -23,7 +24,7 @@ const BANNER: &str = r#"
 const APP_NAME: &str = "sysapi";
 /// app版本号, 来自编译时由build.rs从cargo.toml中读取的版本号(读取内容写入.version文件)
 const APP_VER: &str = include_str!(concat!(env!("OUT_DIR"), "/.version"));
-const SERVICE_PREFIX: &str = "/api/sys/";
+const SERVICE_PREFIX: &str = "/sys/";
 
 appconfig::appglobal_define!(app_global, AppGlobal,
     startup_time: i64,
@@ -45,7 +46,7 @@ appconfig::appconfig_define!(app_conf, AppConf,
     db_user     : String => ["",   "db-user",      "DbUser",            "数据库用户名"],
     db_pass     : String => ["",   "db-pass",      "DbPass",            "数据库密码"],
     db_name     : String => ["",   "db-name",      "DbName",            "数据库名称"],
-    db_extra    : String => ["",   "db-extra",     "DbExtra",           "数据库扩展属性 (example: key1=value1&key2=value2)"],
+    // db_extra    : String => ["",   "db-extra",     "DbExtra",           "数据库扩展属性 (example: key1=value1&key2=value2)"],
     cache_host  : String => ["",   "cache-host",   "CacheHost",         "缓存服务主机名"],
     cache_port  : String => ["",   "cache-port",   "CachePort",         "缓存服务端口"],
     cache_user  : String => ["",   "cache-user",   "CacheUser",         "缓存服务用户名"],
@@ -55,7 +56,7 @@ appconfig::appconfig_define!(app_conf, AppConf,
     jwt_key     : String => ["",   "jwt-key",      "JwtKey",            "令牌密钥"],
     jwt_iss     : String => ["",   "jwt-iss",      "JwtIss",            "令牌发行者"],
     jwt_ttl     : String => ["",   "jwt-ttl",      "JwtTtl",            "令牌存活时间 (单位: 分钟)"],
-    refresh_key : String => ["",   "refresh-key",  "RefreshKey",        "刷新令牌的密钥"],
+    jwt_refresh : String => ["",   "jwt-refresh",  "JwtRefresh",        "刷新令牌的密钥"],
 );
 
 impl Default for AppConf {
@@ -75,17 +76,17 @@ impl Default for AppConf {
             db_user:        String::from("root"),
             db_pass:        String::from("password"),
             db_name:        String::new(),
-            db_extra:       String::new(),
+            // db_extra:       String::new(),
             cache_host:     String::from("127.0.0.1"),
             cache_port:     String::from("6379"),
             cache_user:     String::new(),
             cache_pass:     String::from("password"),
             cache_name:     String::from("0"),
-            cache_pre:      String::from("app"),
+            cache_pre:      String::from("sysapi"),
             jwt_key:        String::from("SysApi CopyRight by kivensoft 2023-05-04"),
             jwt_iss:        String::from("SysApi"),
             jwt_ttl:        String::from("1440"),
-            refresh_key:    String::from("sysapi copyright kivensoft 2023"),
+            jwt_refresh:    String::from("SysApi copyright kivensoft 2023-09-27"),
             // db_url:       String::from("mysql://root:password@127.0.0.1:3306/exampledb?characterEncoding=UTF-8&useSSL=false&serverTimezone=GMT%2B8"),
             // cache_url:    String::from("redis://:password@127.0.0.1/0"),
         }
@@ -95,23 +96,6 @@ impl Default for AppConf {
 macro_rules! arg_err {
     ($text:literal) => {
         concat!("参数 ", $text, " 格式错误")
-    };
-}
-
-#[macro_export]
-macro_rules! api_ok {
-    ($($t:tt)+) => {
-        return Ok(httpserver::ApiResult::ok($($t)*))
-    };
-}
-
-#[macro_export]
-macro_rules! api_fail {
-    ($msg:literal) => {
-        return Ok(httpserver::ApiResult::fail(String::from($msg)))
-    };
-    ($($t:tt)+) => {
-        return Ok(httpserver::ApiResult::fail(format!($($t)*)))
     };
 }
 
@@ -253,7 +237,6 @@ fn reg_apis(srv: &mut HttpServer) {
 
     httpserver::register_apis!(srv, cc!("tools"),
         "ping": apis::tools::ping,
-        "ping/*": apis::tools::ping,
         "status": apis::tools::status,
         "ip": apis::tools::ip,
         "qrcode": apis::tools::qrcode,
@@ -274,39 +257,31 @@ fn reg_apis(srv: &mut HttpServer) {
 
 /// 从网关服务器加载配置
 async fn load_remote_config(ac: &mut AppConf) -> anyhow::Result<()> {
-    set_common_config(ac, rpc::load_config("common").await?);
-    set_sysapi_config(ac, rpc::load_config("sysapi").await?);
+    let cfgs = rpc::load_config("common").await?;
+    for item in cfgs.into_iter() {
+        let val = item.value;
+        match item.key.as_str() {
+            "mysql.host"    => ac.db_host = val,
+            "mysql.port"    => ac.db_port = val,
+            "mysql.user"    => ac.db_user = val,
+            "mysql.pass"    => ac.db_pass = val,
+            "mysql.name"    => ac.db_name = val,
 
+            "redis.host"    => ac.cache_host = val,
+            "redis.port"    => ac.cache_port = val,
+            "redis.user"    => ac.cache_user = val,
+            "redis.pass"    => ac.cache_pass = val,
+            "redis.name"    => ac.cache_name = val,
+
+            "token.key"     => ac.jwt_key = val,
+            "token.iss"     => ac.jwt_iss = val,
+            "token.ttl"     => ac.jwt_ttl = val,
+            "token.refresh" => ac.jwt_refresh = val,
+
+            _ => {}
+        }
+    }
     Ok(())
-}
-
-fn set_common_config(ac: &mut AppConf, cfg: Vec<rpc::CfgItem>) {
-    for item in cfg.into_iter() {
-        match item.key.as_str() {
-            "mysql.host" => ac.db_host = item.value,
-            "mysql.port" => ac.db_port = item.value,
-            "mysql.user" => ac.db_user = item.value,
-            "mysql.pass" => ac.db_pass = item.value,
-            "mysql.name" => ac.db_name = item.value,
-            "redis.host" => ac.cache_host = item.value,
-            "redis.port" => ac.cache_port = item.value,
-            "redis.user" => ac.cache_user = item.value,
-            "redis.pass" => ac.cache_pass = item.value,
-            "redis.name" => ac.cache_name = item.value,
-            _ => {}
-        }
-    }
-}
-
-fn set_sysapi_config(ac: &mut AppConf, cfg: Vec<rpc::CfgItem>) {
-    for item in cfg.into_iter() {
-        match item.key.as_str() {
-            "token.key" => ac.jwt_key = item.value,
-            "token.iss" => ac.jwt_iss = item.value,
-            "token.ttl" => ac.jwt_ttl = item.value,
-            _ => {}
-        }
-    }
 }
 
 // #[tokio::main(worker_threads = 4)]
@@ -320,7 +295,8 @@ fn main() {
 
     let threads = ac.threads.parse::<usize>().expect(arg_err!("threads"));
     let addr: std::net::SocketAddr = ac.listen.parse().expect(arg_err!("listen"));
-    let mut srv = HttpServer::new(SERVICE_PREFIX, true);
+    let mut srv = HttpServer::new(
+        &format_compact!("{}{}", auth::API_PATH_PRE, SERVICE_PREFIX), true);
 
     reg_apis(&mut srv);
 
@@ -335,6 +311,7 @@ fn main() {
                 log::debug!("使用本地配置启动服务...");
             }
         }
+
         ag.jwt_ttl = ac.jwt_ttl.parse::<u32>().expect("配置jwt-ttl格式错误") * 60;
         log::trace!("配置: {ac:#?}");
 

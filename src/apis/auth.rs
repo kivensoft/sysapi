@@ -7,10 +7,9 @@ use crate::{
     services::{rcache, rmq},
     utils,
 };
-use anyhow::{Result, Context};
+use anyhow::Result;
 use base64::{engine::general_purpose, Engine};
 use compact_str::CompactString;
-use cookie::{Cookie, time::Duration};
 use httpserver::{HttpContext, Resp, HttpResult};
 use itoa::Buffer;
 use localtime::LocalTime;
@@ -38,7 +37,6 @@ pub async fn login(ctx: HttpContext) -> HttpResult {
     struct Req {
         username: CompactString,
         password: CompactString,
-        use_cookie: Option<bool>,
     }
 
     type Res = LoginRes;
@@ -62,7 +60,8 @@ pub async fn login(ctx: HttpContext) -> HttpResult {
     // 生成登录返回结果
     let token = gen_token(user_id)?;
     let key = gen_refresh_token(user.username.as_ref().unwrap(), &token);
-    let expire = (utils::time::unix_timestamp() + AppGlobal::get().jwt_ttl as u64) as i64;
+    let jwt_ttl = AppGlobal::get().jwt_ttl;
+    let expire = (utils::time::unix_timestamp() + jwt_ttl as u64) as i64;
     let expire = LocalTime::from_unix_timestamp(expire);
 
     tokio::spawn(async move {
@@ -77,24 +76,7 @@ pub async fn login(ctx: HttpContext) -> HttpResult {
         }
     });
 
-    if param.use_cookie.unwrap_or(false) {
-        let cookie = Cookie::build(auth::ACCESS_TOKEN, token.to_owned())
-            .max_age(Duration::seconds(AppGlobal::get().jwt_ttl as i64))
-            .finish();
-        let body = hyper::Body::from(
-            serde_json::to_vec(&httpserver::ApiResult {
-                code: 200,
-                message: None,
-                data: Some(&Res { token, key, expire, user_id }),
-            })?
-        );
-        Ok(hyper::Response::builder()
-                .header(httpserver::CONTENT_TYPE, httpserver::APPLICATION_JSON)
-                .header("Set-Cookie", cookie.to_string())
-                .body(body).context("response build error")?)
-    } else {
-        Resp::ok(&Res { token, key, expire, user_id })
-    }
+    Resp::ok(&Res { token, key, expire, user_id })
 
 }
 
@@ -241,7 +223,7 @@ fn gen_token(user_id: u32) -> Result<String> {
 fn gen_refresh_token(username: &str, token: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(token);
-    hasher.update(&AppConf::get().refresh_key);
+    hasher.update(&AppConf::get().jwt_refresh);
     hasher.update(username);
 
     general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())

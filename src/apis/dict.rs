@@ -10,7 +10,7 @@ pub async fn list(ctx: HttpContext) -> HttpResult {
     type Req = PageQuery<SysDict>;
 
     let param: Req = ctx.into_json().await?;
-    let page_data = SysDict::select_page(param.data(), param.page()).await;
+    let page_data = SysDict::select_page(param.data(), param.to_page_info()).await;
     let page_data = check_result!(page_data);
     Resp::ok(&page_data)
 }

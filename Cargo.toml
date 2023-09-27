@@ -1,7 +1,7 @@
 # cargo build --release --target=x86_64-unknown-linux-musl
 [package]
 name = "sysapi"
-version = "0.7.4"
+version = "0.7.5"
 authors = ["kiven <kivensoft@gmail.com>"]
 edition = "2021"
 description = "system api for application"

@@ -1,6 +1,6 @@
 //! 实用工具接口
 
-use crate::{AppGlobal, utils::unix_crypt};
+use crate::{AppGlobal, utils::unix_crypt, auth};
 use compact_str::{format_compact, CompactString, ToCompactString};
 use fast_qr::{
     convert::{image::ImageBuilder, Builder, Shape},
@@ -43,15 +43,21 @@ pub async fn status(ctx: HttpContext) -> HttpResult {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Res {
-        startup: LocalTime, // 服务启动时间
-        responses: u32, // 总相应次数
+        startup:      LocalTime,    // 服务启动时间
+        resp_count:   u32,          // 总响应次数
+        content_path: &'static str, // 上下文路径
+        app_name:     &'static str, // 应用名称
+        app_ver:      &'static str, // 应用版本
     }
 
     let app_global = AppGlobal::get();
 
     Resp::ok(&Res {
         startup: LocalTime::from_unix_timestamp(app_global.startup_time),
-        responses: ctx.id(),
+        resp_count: ctx.id(),
+        content_path: auth::API_PATH_PRE,
+        app_name: crate::APP_NAME,
+        app_ver: crate::APP_VER,
     })
 }
 
