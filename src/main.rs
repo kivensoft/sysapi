@@ -175,6 +175,8 @@ fn reg_apis(srv: &mut HttpServer) {
         "del": apis::api::del,
         "items": apis::api::items,
         "rearrange": apis::api::rearrange,
+        "groups": apis::api::groups,
+        "permissions": apis::api::permissions,
     );
 
     httpserver::register_apis!(srv, cc!("auth"),

@@ -28,10 +28,11 @@ pub struct PageQuery<T> {
     pub inner: T,
     pub i: u32,
     pub p: u32,
-    pub a: Option<u32>,
+    pub a: Option<i32>,
 }
 
 impl PageInfo {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -53,37 +54,13 @@ impl <T> PageQuery<T> {
     }
 
     pub fn to_page_info(&self) -> PageInfo {
-        PageInfo { index: self.i, size: self.p, total: self.a }
-    }
-}
-
-#[macro_export]
-macro_rules! sql_eq {
-    ($t:literal) => {
-        concat($t, " = :", $t)
-    };
-}
-
-#[macro_export]
-macro_rules! opt_params_map {
-    ($obj:ident, $($e:tt,)*) => {{
-        let mut params = std::collections::HashMap::<std::vec::Vec<u8>, mysql_async::Value>::new();
-        let mut sql = String::new();
-
-        $(
-            if $obj.$e.is_some() {
-                sql.push_str(" and ");
-                sql.push_str(stringify!($e));
-                sql.push_str(" = :");
-                sql.push_str(stringify!($e));
-                params.insert(stringify!($e).as_bytes().to_owned(), mysql_async::Value::from($obj.$e.as_ref().unwrap()));
-            }
-        )*
-
-        if params.is_empty() {
-            (sql, mysql_async::Params::Empty)
-        } else {
-            (sql, mysql_async::Params::Named(params))
+        PageInfo {
+            index: self.i,
+            size: self.p,
+            total: match self.a {
+                Some(total) => if total < 0 { None } else { Some(total as u32) },
+                None => None,
+            },
         }
-    }};
+    }
 }

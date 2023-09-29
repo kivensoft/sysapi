@@ -16,28 +16,22 @@ table_define!("t_sys_config", SysConfig,
 impl SysConfig {
     /// 查询记录
     pub async fn select_page(value: &SysConfig, page: PageInfo) -> Result<PageData<SysConfig>> {
-        let (tsql, psql, params) = gensql::SelectSql::with_page(page.index, page.size)
-            .select_slice("", &Self::fields())
+        let (tsql, psql, params) = gensql::SelectSql::new()
+            .select_slice("", Self::FIELDS)
             .from(Self::TABLE)
             .where_sql()
-            .and_like_opt("", Self::CFG_NAME, &value.cfg_name)
-            .and_like_opt("", Self::CFG_VALUE, &value.cfg_value)
-            .and_like_opt("", Self::CFG_REMARK, &value.cfg_remark)
-            .end_where()
-            .build_with_page()?;
+                .like_opt("", Self::CFG_NAME, &value.cfg_name)
+                .like_opt("", Self::CFG_VALUE, &value.cfg_value)
+                .like_opt("", Self::CFG_REMARK, &value.cfg_remark)
+                .end_where()
+            .build_with_page(page.index, page.size, page.total)?;
 
         let mut conn = get_conn().await?;
 
         let total = if tsql.is_empty() {
-            0
+            page.total.unwrap_or(0)
         } else {
-            match page.total {
-                Some(total) => total,
-                None => conn.query_one_sql(tsql, params.clone())
-                        .await?
-                        .map(|(total,)| total)
-                        .unwrap_or(0),
-            }
+            conn.query_one_sql(&tsql, &params).await?.map(|(total,)| total).unwrap_or(0)
         };
 
         let list = conn.query_all_sql(psql, params, Self::row_map).await?;

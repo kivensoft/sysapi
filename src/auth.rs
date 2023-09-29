@@ -17,14 +17,12 @@ pub const ACCESS_TOKEN: &str = "access_token";
 pub const COOKIE_NAME: &str = "Cookie";
 pub const API_PATH_PRE: &str = "/api"; // 接口请求的统一路径前缀, 权限判断时忽略该前缀
 
-const PUBLIC_PERMIT: u32 = u32::MAX;
-const ANONYMOUS_PERMIT: u32 = u32::MAX - 1;
 const USER_ROLE_CACHE_SIZE: Option<NonZeroUsize> = NonZeroUsize::new(128); //USER_ROLE_CACHE的缓存大小
 
 type StaticShare<T> = Option<RwLock<Arc<T>>>;
 
 static mut ROLES: StaticShare<HashMap<u32, CompactString>> = None;
-static mut PERMITS: StaticShare<HashMap<CompactString, Vec<u32>>> = None;
+static mut PERMITS: StaticShare<HashMap<CompactString, Vec<i16>>> = None;
 static mut USER_ROLE_CACHE: Option<Mutex<LruCache<u32, u32>>> = None;
 
 pub struct Authentication;
@@ -72,7 +70,7 @@ impl httpserver::HttpMiddleware for Authentication {
                 Ok(val) => ctx.set_uid(val),
                 Err(e) => {
                     log::error!("[{:08x}] AUTH verify token error: {:?}", ctx.id(), e);
-                    return Err(e);
+                    anyhow::bail!("无效的令牌");
                 }
             }
         }
@@ -192,7 +190,7 @@ pub fn decode_token(token: &str) -> Result<u32> {
     if let Some((_, token)) = token.split_once('.') {
         if let Some((body, _)) = token.split_once('.') {
             let body_bs = general_purpose::URL_SAFE_NO_PAD.decode(body)?;
-            let claim = serde_json::from_slice::<TokenBody>(&body_bs)?;
+            let claim = serde_json::from_slice::<TokenBody>(&body_bs).context("反序列化token内容异常")?;
             return Ok(claim.uid);
         }
     }
@@ -250,11 +248,11 @@ fn get_access_token(ctx: &HttpContext) -> Result<Option<Cow<str>>> {
 }
 
 /// 校验用户访问许可是否在给定的索引列表内
-fn check_permit(uid: u32, permits: &str, ps: &[u32]) -> bool {
+fn check_permit(uid: u32, permits: &str, ps: &[i16]) -> bool {
     for i in ps.iter() {
         match *i {
-            ANONYMOUS_PERMIT => return true,
-            PUBLIC_PERMIT => if uid != 0 {
+            utils::ANONYMOUS_PERMIT_CODE => return true,
+            utils::PUBLIC_PERMIT_CODE => if uid != 0 {
                 return true
             },
             index => if utils::bits::get(permits, index as usize) {
@@ -282,13 +280,13 @@ async fn load_roles() -> Result<HashMap<u32, CompactString>> {
 }
 
 /// 从数据库中加载权限信息表, 返回所有路径对应的权限索引组
-async fn load_permits() -> Result<HashMap<CompactString, Vec<u32>>> {
+async fn load_permits() -> Result<HashMap<CompactString, Vec<i16>>> {
     let mut permits = HashMap::new();
     let api_data = SysApi::select_all().await?;
     // permits.insert(CompactString::new("/login"), vec![ANONYMOUS_PERMIT]);
 
     for a in &api_data {
-        let pcode = a.permission_code.unwrap() as u32;
+        let pcode = a.permission_code.unwrap();
         let api_path = CompactString::new(a.api_path.as_ref().unwrap());
         let v = permits.entry(api_path).or_insert_with(Vec::new);
         v.push(pcode);

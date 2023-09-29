@@ -23,30 +23,24 @@ table_define!("t_sys_user", SysUser,
 impl SysUser {
     /// 查询记录
      pub async fn select_page(value: &SysUser, page: PageInfo) -> Result<PageData<SysUser>> {
-        let (tsql, psql, params) = gensql::SelectSql::with_page(page.index, page.size)
-            .select_slice("", &Self::fields())
+        let (tsql, psql, params) = gensql::SelectSql::new()
+            .select_slice("", Self::FIELDS)
             .from(Self::TABLE)
             .where_sql()
-            .and_eq_opt("", Self::ROLE_ID, &value.role_id)
-            .and_like_opt("", Self::USERNAME, &value.username)
-            .and_like_opt("", Self::NICKNAME, &value.nickname)
-            .and_like_opt("", Self::MOBILE, &value.mobile)
-            .and_like_opt("", Self::EMAIL, &value.email)
-            .end_where()
-            .build_with_page()?;
+                .eq_opt("", Self::ROLE_ID, &value.role_id)
+                .like_opt("", Self::USERNAME, &value.username)
+                .like_opt("", Self::NICKNAME, &value.nickname)
+                .like_opt("", Self::MOBILE, &value.mobile)
+                .like_opt("", Self::EMAIL, &value.email)
+                .end_where()
+            .build_with_page(page.index, page.size, page.total)?;
 
         let mut conn = get_conn().await?;
 
         let total = if tsql.is_empty() {
-            0
+            page.total.unwrap_or(0)
         } else {
-            match page.total {
-                Some(total) => total,
-                None => conn.query_one_sql(tsql, params.clone())
-                        .await?
-                        .map(|(total,)| total)
-                        .unwrap_or(0),
-            }
+            conn.query_one_sql(&tsql, &params).await?.map(|(total,)| total).unwrap_or(0)
         };
 
         let list = conn.query_all_sql(psql, params, Self::row_map).await?;
@@ -70,7 +64,7 @@ impl SysUser {
             .select_slice("", &FIELDS)
             .from(Self::TABLE)
             .where_sql()
-            .and_eq("", col, &account.to_owned())
+            .eq("", col, &account.to_owned())
             .end_where()
             .build();
 
@@ -88,14 +82,14 @@ impl SysUser {
 
     pub async fn select_by(value: &SysUser) -> Result<Vec<SysUser>> {
         let (sql, params) = gensql::SelectSql::new()
-            .select_slice("", &Self::fields())
+            .select_slice("", Self::FIELDS)
             .from(Self::TABLE)
             .where_sql()
-            .and_eq_opt("", Self::ROLE_ID, &value.role_id)
-            .and_like_opt("", Self::USERNAME, &value.username)
-            .and_like_opt("", Self::NICKNAME, &value.nickname)
-            .and_like_opt("", Self::MOBILE, &value.mobile)
-            .and_like_opt("", Self::EMAIL, &value.email)
+            .eq_opt("", Self::ROLE_ID, &value.role_id)
+            .like_opt("", Self::USERNAME, &value.username)
+            .like_opt("", Self::NICKNAME, &value.nickname)
+            .like_opt("", Self::MOBILE, &value.mobile)
+            .like_opt("", Self::EMAIL, &value.email)
             .end_where()
             .build();
 
@@ -110,7 +104,7 @@ impl SysUser {
             .select(Self::ROLE_ID)
             .from(Self::TABLE)
             .where_sql()
-            .and_eq("", Self::USER_ID, &id)
+            .eq("", Self::USER_ID, &id)
             .end_where()
             .build();
 
@@ -126,7 +120,7 @@ impl SysUser {
             .join(R::TABLE, "r")
             .on_eq("t", Self::ROLE_ID, "r", R::ROLE_ID)
             .where_sql()
-            .and_eq("t", Self::USER_ID, &id)
+            .eq("t", Self::USER_ID, &id)
             .end_where()
             .build();
         query_one_sql(&sql, &params).await

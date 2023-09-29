@@ -1,11 +1,10 @@
 use anyhow::Result;
 use compact_str::format_compact;
-use gensql::{table_define, get_conn, query_one_sql, query_all_sql, row_map, vec_value, Queryable};
+use gensql::{table_define, get_conn, query_one_sql, query_all_sql, row_map, vec_value, Queryable, Row, FromValue, struct_flatten};
 use localtime::LocalTime;
-use serde::{Serialize, Deserialize};
 use tokio::sync::OnceCell;
 
-use crate::{AppConf, services::{rcache, rmq}};
+use crate::{AppConf, services::{rcache, rmq}, db::{sys_permission::SysPermission, sys_dict::{SysDict, DictType}}};
 
 use super::{PageData, PageInfo};
 
@@ -15,7 +14,7 @@ table_define!("t_sys_menu", SysMenu,
     menu_id:            u32       => MENU_ID,
     client_type:        u16       => CLIENT_TYPE,
     menu_code:          String    => MENU_CODE,
-    permission_code:    i32       => PERMISSION_CODE,
+    permission_code:    i16       => PERMISSION_CODE,
     menu_name:          String    => MENU_NAME,
     menu_link:          String    => MENU_LINK,
     menu_icon:          String    => MENU_ICON,
@@ -23,48 +22,109 @@ table_define!("t_sys_menu", SysMenu,
     updated_time:       LocalTime => UPDATED_TIME,
 );
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct SysMenuExt {
-    #[serde(flatten)]
-    pub inner: SysMenu,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_menu_code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub menus: Option<Vec<SysMenuExt>>,
-}
+struct_flatten!(SysMenuVo, SysMenu,
+    client_type_name: String          => CLIENT_TYPE_NAME,
+    permission_name:  String          => PERMISSION_NAME,
+
+    group_code:       i16             => GROUP_CODE,
+    group_name:       String          => GROUP_NAME,
+
+    parent_menu_code: String          => PARENT_MENU_CODE,
+    parent_menu_name: String          => PARENT_MENU_NAME,
+
+    menus:            Vec<SysMenuVo> => MENUS,
+);
+
 
 impl SysMenu {
     /// 查询记录
-    pub async fn select_page(value: &SysMenu, page: PageInfo) -> Result<PageData<SysMenu>> {
-        let (tsql, psql, params) = gensql::SelectSql::with_page(page.index, page.size)
-            .select_slice("", &Self::fields())
-            .from(Self::TABLE)
+    pub async fn select_page(value: &SysMenu, page: PageInfo) -> Result<PageData<SysMenuVo>> {
+        type T = SysMenu;
+        type C = SysDict;
+        type P = SysPermission;
+        type G = SysDict;
+        type T1 = SysMenu;
+
+        const T: &str = "t";
+        const C: &str = "c";
+        const P: &str = "p";
+        const G: &str = "g";
+        const T1: &str = "t1";
+
+        let (tsql, psql, params) = gensql::SelectSql::new()
+            .select_slice(T, Self::FIELDS)
+                .select_as(C, C::DICT_NAME, SysMenuVo::CLIENT_TYPE_NAME)
+                .select_ext(P, P::PERMISSION_NAME)
+                .select_as(G, G::DICT_CODE, SysMenuVo::GROUP_CODE)
+                .select_as(G, G::DICT_NAME, SysMenuVo::GROUP_NAME)
+                .select_as(T1, T1::MENU_NAME, SysMenuVo::PARENT_MENU_NAME)
+            .from_alias(Self::TABLE, T)
+            .left_join(P::TABLE, P)
+                .on_eq(P, P::PERMISSION_CODE, T, T::PERMISSION_CODE)
+            .left_join(T1::TABLE, T1)
+                .on(&format_compact!("{}.{} = left({}.{}, length({}.{}) - 2)",
+                    T1, T1::MENU_CODE, T, T::MENU_CODE, T, T::MENU_CODE))
+            .left_join(C::TABLE, C)
+                .on_eq(C, C::DICT_CODE, T, T::CLIENT_TYPE)
+                .on_eq_val(C, C::DICT_TYPE, &(DictType::ClientType as u16))
+            .left_join(G::TABLE, G)
+                .on_eq(G, G::DICT_CODE, P, P::GROUP_CODE)
+                .on_eq_val(G, G::DICT_TYPE, &(DictType::PermissionGroup as u16))
             .where_sql()
-            .and_eq_opt("", Self::CLIENT_TYPE, &value.client_type)
-            .and_eq_opt("", Self::PERMISSION_CODE, &value.permission_code)
-            .and_like_opt("", Self::MENU_NAME, &value.menu_name)
-            .and_like_opt("", Self::MENU_LINK, &value.menu_link)
-            .and_like_right_opt("", Self::MENU_CODE, &value.menu_code)
-            .end_where()
-            .order_by("", Self::MENU_CODE)
-            .build_with_page()?;
+                .eq_opt(T, Self::CLIENT_TYPE, &value.client_type)
+                .eq_opt(T, Self::PERMISSION_CODE, &value.permission_code)
+                .like_opt(T, Self::MENU_NAME, &value.menu_name)
+                .like_opt(T, Self::MENU_LINK, &value.menu_link)
+                .like_right_opt(T, Self::MENU_CODE, &value.menu_code)
+                .end_where()
+            .order_by(T, Self::MENU_CODE)
+            .build_with_page(page.index, page.size, page.total)?;
 
         let mut conn = get_conn().await?;
 
         let total = if tsql.is_empty() {
-            0
+            page.total.unwrap_or(0)
         } else {
-            match page.total {
-                Some(total) => total,
-                None => conn.query_one_sql(tsql, params.clone())
-                        .await?
-                        .map(|(total,)| total)
-                        .unwrap_or(0),
-            }
+            conn.query_one_sql(&tsql, &params).await?.map(|(total,)| total).unwrap_or(0)
         };
 
-        let list = conn.query_all_sql(psql, params, Self::row_map).await?;
+        let list = conn.query_all_sql(psql, params, |row: Row| {
+            let mut row_iter = row.unwrap().into_iter();
+
+            macro_rules! fv {
+                () => { FromValue::from_value(row_iter.next().unwrap()) };
+            }
+
+            let mut res = SysMenuVo {
+                inner: SysMenu {
+                    menu_id:         fv!(),
+                    client_type:     fv!(),
+                    menu_code:       fv!(),
+                    permission_code: fv!(),
+                    menu_name:       fv!(),
+                    menu_link:       fv!(),
+                    menu_icon:       fv!(),
+                    menu_desc:       fv!(),
+                    updated_time:    fv!(),
+                },
+                client_type_name: fv!(),
+                permission_name:  fv!(),
+                group_code:       fv!(),
+                group_name:       fv!(),
+                parent_menu_code: None,
+                parent_menu_name: fv!(),
+                menus:            None,
+            };
+
+            if let Some(mc) = &res.inner.menu_code {
+                if mc.len() >= 2 {
+                    let pmc = &mc[0..mc.len() - 2];
+                    res.parent_menu_code = Some(pmc.to_owned());
+                }
+            }
+
+            res
+        }).await?;
 
         Ok(PageData { total, list, })
     }
@@ -108,7 +168,7 @@ impl SysMenu {
             .select_slice("", &FIELDS)
             .from(Self::TABLE)
             .where_sql()
-            .and_eq("", Self::CLIENT_TYPE, &client_type)
+            .eq("", Self::CLIENT_TYPE, &client_type)
             .end_where()
             .order_by("", Self::MENU_CODE)
             .build();
@@ -130,14 +190,17 @@ impl SysMenu {
     }
 
     pub async fn select_all() -> Result<Vec<SysMenu>> {
-        Self::select_page(&SysMenu::default(), PageInfo::new())
-            .await
-            .map(|v| v.list)
+        let (sql, params) = gensql::SelectSql::new()
+            .select_slice("", Self::FIELDS)
+            .from(Self::TABLE)
+            .order_by("", Self::MENU_CODE)
+            .build();
+        query_all_sql(sql, params, Self::row_map).await
     }
 
     pub async fn select_top_level() -> Result<Vec<SysMenu>> {
         let (sql, params) = gensql::SelectSql::new()
-            .select_slice("", &Self::fields())
+            .select_slice("", Self::FIELDS)
             .from(Self::TABLE)
             .where_sql()
             .add_sql(&format_compact!("and {} like '__'", Self::MENU_CODE))

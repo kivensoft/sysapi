@@ -1,9 +1,8 @@
 //! 角色表接口
 
-use crate::{db::{PageQuery, sys_role::SysRole}, services::rmq};
+use crate::{db::{PageQuery, sys_role::SysRole, PageData}, services::rmq};
 use httpserver::{HttpContext, Resp, HttpResult, check_required, check_result};
 use localtime::LocalTime;
-use serde::Serialize;
 
 /// 记录列表
 pub async fn list(ctx: HttpContext) -> HttpResult {
@@ -34,8 +33,11 @@ pub async fn post(ctx: HttpContext) -> HttpResult {
     type Res = SysRole;
 
     let mut param: Req = ctx.into_json().await?;
-    check_required!(param, client_type, role_name);
+    check_required!(param, role_name);
 
+    if param.role_type.is_none() {
+        param.role_type = Some(String::with_capacity(0))
+    }
     param.updated_time = Some(LocalTime::now());
 
     if param.permissions.is_none() {
@@ -83,20 +85,14 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
 /// 获取指定类别的所有字典项
 pub async fn items(ctx: HttpContext) -> HttpResult {
     type Req = SysRole;
-
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Res {
-        roles: Vec<SysRole>,
-    }
+    type Res = PageData<SysRole>;
 
     let param: Option<Req> = ctx.into_opt_json().await?;
-    let client_type = match param {
-        Some(v) => v.client_type,
+    let role_type = match param {
+        Some(v) => v.role_type,
         None => None,
     };
-    let rec = SysRole::select_by_type(client_type).await;
-    let rec = check_result!(rec);
+    let list = check_result!(SysRole::select_by_role_type(role_type).await);
 
-    Resp::ok(&Res { roles: rec })
+    Resp::ok(&Res { total: list.len() as u32, list, })
 }

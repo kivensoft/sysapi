@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    db::{PageQuery, sys_menu::{SysMenu, SysMenuExt}},
+    db::{PageQuery, sys_menu::{SysMenu, SysMenuVo}, PageData},
     services::rmq
 };
 
@@ -11,7 +11,6 @@ use anyhow::Result;
 use compact_str::format_compact;
 use httpserver::{HttpContext, Resp, HttpResult, check_required, check_result};
 use localtime::LocalTime;
-use serde::Serialize;
 
 /// 记录列表
 pub async fn list(ctx: HttpContext) -> HttpResult {
@@ -39,7 +38,7 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
 
 /// 更新单条记录
 pub async fn post(ctx: HttpContext) -> HttpResult {
-    type Req = SysMenuExt;
+    type Req = SysMenuVo;
     type Res = SysMenu;
 
     let mut param: Req = ctx.into_json().await?;
@@ -116,26 +115,17 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
 
 /// 返回权限的树形结构
 pub async fn top_level(_ctx: HttpContext) -> HttpResult {
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Res {
-        menus: Vec<SysMenu>,
-    }
+    type Res = PageData<SysMenu>;
 
-    let menus = check_result!(SysMenu::select_top_level().await);
+    let list = check_result!(SysMenu::select_top_level().await);
 
-    Resp::ok(&Res { menus })
+    Resp::ok(&Res { total: list.len() as u32, list, })
 }
 
 /// 返回权限的树形结构
 pub async fn tree(ctx: HttpContext) -> HttpResult {
     type Req = SysMenu;
-
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Res {
-        menus: Vec<SysMenuExt>,
-    }
+    type Res = PageData<SysMenuVo>;
 
     let param: Req = ctx.into_json().await?;
     check_required!(param, client_type);
@@ -158,7 +148,7 @@ pub async fn tree(ctx: HttpContext) -> HttpResult {
             });
     }
 
-    let mut top_menu = SysMenuExt {
+    let mut top_menu = SysMenuVo {
         inner: SysMenu {
             menu_code: Some("".to_owned()),
             ..Default::default()
@@ -167,13 +157,14 @@ pub async fn tree(ctx: HttpContext) -> HttpResult {
     };
     build_tree(&mut top_menu, &menu_map)?;
 
+    let list = top_menu.menus.unwrap_or_default();
 
-    Resp::ok(&Res { menus: top_menu.menus.unwrap_or_default() })
+    Resp::ok(&Res { total: list.len() as u32, list, })
 }
 
 /// 重新排序权限
 pub async fn rearrange(ctx: HttpContext) -> HttpResult {
-    type Req = Vec<SysMenuExt>;
+    type Req = Vec<SysMenuVo>;
 
     let param: Req = ctx.into_json().await?;
 
@@ -188,17 +179,16 @@ pub async fn rearrange(ctx: HttpContext) -> HttpResult {
     Resp::ok_with_empty()
 }
 
-fn build_tree<'a>(menu: &'a mut SysMenuExt,
+fn build_tree<'a>(menu: &'a mut SysMenuVo,
         menu_map: &'a HashMap<&'a str, Vec<&'a SysMenu>>) -> Result<()> {
 
     let menu_code = menu.inner.menu_code.as_ref().unwrap();
 
     if let Some(children) = menu_map.get(menu_code.as_str()) {
         menu.menus = Some(
-            children.iter().map(|v| SysMenuExt{
+            children.iter().map(|v| SysMenuVo {
                 inner: (*v).clone(),
-                parent_menu_code: None,
-                menus: None,
+                ..Default::default()
             }).collect()
         );
 
@@ -211,7 +201,7 @@ fn build_tree<'a>(menu: &'a mut SysMenuExt,
 }
 
 fn tree_to_list(list: &mut Vec<SysMenu>, parent_menu_code: &str,
-        tree_menus: &[SysMenuExt]) {
+        tree_menus: &[SysMenuVo]) {
 
     for (i, item) in tree_menus.iter().enumerate() {
         let menu_code = format_compact!("{parent_menu_code}{:02}", i + 1);

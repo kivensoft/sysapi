@@ -6,7 +6,7 @@ use crate::{
     db::{
         PageQuery,
         sys_permission::{SysPermission, SysPermissionRearrange},
-        sys_dict::{SysDict, DictType}
+        sys_dict::{SysDict, DictType}, PageData
     },
     services::rmq
 };
@@ -14,6 +14,14 @@ use crate::{
 use httpserver::{HttpContext, Resp, HttpResult, check_required, check_result};
 use localtime::LocalTime;
 use serde::Serialize;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TreeItem<'a> {
+    #[serde(flatten)]
+    dict: &'a SysDict,
+    permissions: Vec<&'a SysPermission>,
+}
 
 /// 记录列表
 pub async fn list(ctx: HttpContext) -> HttpResult {
@@ -95,31 +103,23 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
 
 /// 返回权限的字典表
 pub async fn items(_ctx: HttpContext) -> HttpResult {
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Res {
-        permissions: Vec<SysPermission>,
-    }
+    type Res = PageData<SysPermission>;
 
-    let permissions = check_result!(SysPermission::select_all().await);
+    let list = check_result!(SysPermission::select_all().await);
 
-    Resp::ok(&Res { permissions })
+    Resp::ok(&Res { total: list.len() as u32, list, })
 }
 
 /// 返回权限的树形结构
 pub async fn tree(_ctx: HttpContext) -> HttpResult {
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Res<'a> {
-        tree: Vec<TreeItem<'a>>,
-    }
+    type Res<'a> = PageData<TreeItem<'a>>;
 
     let pg_type = DictType::PermissionGroup as u16;
     let dicts = check_result!(SysDict::select_by_type(pg_type).await);
     let permissions = check_result!(SysPermission::select_all().await);
     let tree = make_tree(&dicts, &permissions);
 
-    Resp::ok(&Res { tree })
+    Resp::ok(&Res { total: tree.len() as u32, list: tree, })
 }
 
 /// 重新排序权限
@@ -141,14 +141,6 @@ pub async fn rearrange(ctx: HttpContext) -> HttpResult {
     Resp::ok_with_empty()
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TreeItem<'a> {
-    #[serde(flatten)]
-    dict: &'a SysDict,
-    permissions: Vec<&'a SysPermission>,
-}
-
 fn make_tree<'a>(dicts: &'a [SysDict], permissions: &'a [SysPermission]) -> Vec<TreeItem<'a>> {
     let mut pmap: HashMap<_, Vec<_>> = HashMap::new();
     for item in permissions.iter() {
@@ -159,7 +151,7 @@ fn make_tree<'a>(dicts: &'a [SysDict], permissions: &'a [SysPermission]) -> Vec<
 
     let result = dicts.iter()
         .map(|dict| {
-            let permissions = pmap.remove(&dict.dict_code.unwrap())
+            let permissions = pmap.remove(&(dict.dict_code.unwrap() as i16))
                 .unwrap_or_default();
 
             TreeItem {

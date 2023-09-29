@@ -3,7 +3,7 @@
 use anyhow::Result;
 use mysql_async::{Pool, prelude::{self, FromRow, StatementLike}, Params, TxOpts};
 
-pub use mysql_common::value::{convert::ToValue, Value};
+pub use mysql_common::{row::Row, value::{convert::{ToValue, FromValue}, Value}};
 use parking_lot::Mutex;
 use triomphe::Arc;
 

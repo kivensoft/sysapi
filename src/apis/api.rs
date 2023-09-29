@@ -1,16 +1,15 @@
 //! 系统接口权限管理
 
 use crate::{
-    db::{PageQuery, sys_api::{SysApi, SysApiExt}},
-    services::rmq
+    db::{PageQuery, sys_api::{SysApi, SysApiVo}, sys_dict::{DictType, SysDict}, self, sys_permission::SysPermission, PageData},
+    services::rmq, utils
 };
 use httpserver::{HttpContext, Resp, HttpResult, check_result};
 use localtime::LocalTime;
-use serde::Serialize;
 
 /// 记录列表
 pub async fn list(ctx: HttpContext) -> HttpResult {
-    type Req = PageQuery<SysApiExt>;
+    type Req = PageQuery<SysApiVo>;
 
     let param: Req = ctx.into_json().await?;
     let page_data = SysApi::select_page(param.data(), param.to_page_info()).await;
@@ -86,17 +85,13 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
     Resp::ok_with_empty()
 }
 
-/// 返回权限的树形结构
+/// 返回所有接口信息
 pub async fn items(_ctx: HttpContext) -> HttpResult {
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Res {
-        apis: Vec<SysApi>,
-    }
+    type Res = PageData<SysApi>;
 
-    let apis = check_result!(SysApi::select_all().await);
+    let list = check_result!(SysApi::select_all().await);
 
-    Resp::ok(&Res { apis })
+    Resp::ok(&Res { total: list.len() as u32, list })
 }
 
 /// 重新排序权限
@@ -113,4 +108,52 @@ pub async fn rearrange(ctx: HttpContext) -> HttpResult {
     check_result!(SysApi::batch_update_permission_id(&param).await);
 
     Resp::ok_with_empty()
+}
+
+/// 返回权限组列表(带内置权限项)
+pub async fn groups(_ctx: HttpContext) -> HttpResult {
+    type Res = db::PageData<SysDict>;
+
+    let groups = SysDict::select_by_type(DictType::PermissionGroup as u16).await;
+    let groups = check_result!(groups);
+
+    // 添加内置权限组
+    let mut list = Vec::with_capacity(groups.len() + 1);
+    list.push(SysDict {
+        dict_code: Some(utils::INNER_GROUP_CODE),
+        dict_name: Some(utils::INNER_GROUP_NAME.to_owned()),
+        ..Default::default()
+    });
+    for item in groups.into_iter() {
+        list.push(item);
+    }
+
+    Resp::ok(&Res { total: list.len() as u32, list })
+}
+
+/// 返回权限列表(带内置权限项)
+pub async fn permissions(_ctx: HttpContext) -> HttpResult {
+    type Res = db::PageData<SysPermission>;
+
+    let apis = check_result!(SysPermission::select_all().await);
+
+    // 添加内置权限项
+    let mut list = Vec::with_capacity(apis.len() + 1);
+    list.push(SysPermission {
+        group_code: Some(utils::INNER_GROUP_CODE),
+        permission_code: Some(utils::ANONYMOUS_PERMIT_CODE),
+        permission_name: Some(utils::ANONYMOUS_PERMIT_NAME.to_owned()),
+        ..Default::default()
+    });
+    list.push(SysPermission {
+        group_code: Some(utils::INNER_GROUP_CODE),
+        permission_code: Some(utils::PUBLIC_PERMIT_CODE),
+        permission_name: Some(utils::PUBLIC_PERMIT_NAME.to_owned()),
+        ..Default::default()
+    });
+    for item in apis.into_iter() {
+        list.push(item);
+    }
+
+    Resp::ok(&Res { total: list.len() as u32, list })
 }

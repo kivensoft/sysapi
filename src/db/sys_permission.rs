@@ -2,8 +2,9 @@ use std::{collections::HashMap, hash::Hash};
 
 use anyhow::{Result, Context};
 use compact_str::format_compact;
-use gensql::{table_define, Transaction, get_conn, query_one_sql, vec_value, Queryable};
+use gensql::{table_define, Transaction, get_conn, query_one_sql, vec_value, Queryable, query_all_sql};
 use localtime::LocalTime;
+use serde::{Serialize, Deserialize};
 
 use crate::{
     db::{
@@ -19,53 +20,82 @@ use super::{PageData, PageInfo};
 
 table_define!("t_sys_permission", SysPermission,
     permission_id:      u32       => PERMISSION_ID,
-    group_code:         u16       => GROUP_CODE,
-    permission_code:    u16       => PERMISSION_CODE,
+    group_code:         i16       => GROUP_CODE,
+    permission_code:    i16       => PERMISSION_CODE,
     permission_name:    String    => PERMISSION_NAME,
     updated_time:       LocalTime => UPDATED_TIME,
 );
 
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SysPermissionVo {
+    #[serde(flatten)]
+    inner: SysPermission,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group_name: Option<String>,
+}
+
+const GROUP_NAME: &str = "group_name";
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SysPermissionRearrange {
-    pub group_code: u16,
-    pub permission_codes: Vec<u16>,
+    pub group_code: i16,
+    pub permission_codes: Vec<i16>,
 }
 
 impl SysPermission {
     /// 查询记录
-    pub async fn select_page(value: &SysPermission, page: PageInfo) -> Result<PageData<SysPermission>> {
-        let (tsql, psql, params) = gensql::SelectSql::with_page(page.index, page.size)
-            .select_slice("", &Self::fields())
-            .from(Self::TABLE)
+    pub async fn select_page(value: &SysPermission, page: PageInfo) -> Result<PageData<SysPermissionVo>> {
+        const T: &str = "t";
+        const G: &str = "g";
+
+        let (tsql, psql, params) = gensql::SelectSql::new()
+            .select_slice(T, Self::FIELDS)
+                .select_as(G, SysDict::DICT_NAME, GROUP_NAME)
+            .from_alias(Self::TABLE, T)
+            .left_join(SysDict::TABLE, G)
+                .on_eq(G, SysDict::DICT_CODE, T, Self::GROUP_CODE)
+                .on_eq_val(G, SysDict::DICT_TYPE, &(DictType::PermissionGroup as u16))
             .where_sql()
-            .and_eq_opt("", Self::GROUP_CODE, &value.group_code)
-            .and_like_opt("", Self::PERMISSION_NAME, &value.permission_name)
-            .end_where()
-            .order_by("", Self::PERMISSION_CODE)
-            .build_with_page()?;
+                .eq_opt(T, Self::GROUP_CODE, &value.group_code)
+                .like_opt(T, Self::PERMISSION_NAME, &value.permission_name)
+                .end_where()
+            .order_by(T, Self::PERMISSION_CODE)
+            .build_with_page(page.index, page.size, page.total)?;
 
         let mut conn = get_conn().await?;
 
         let total = if tsql.is_empty() {
-            0
+            page.total.unwrap_or(0)
         } else {
-            match page.total {
-                Some(total) => total,
-                None => conn.query_one_sql(tsql, params.clone())
-                        .await?
-                        .map(|(total,)| total)
-                        .unwrap_or(0),
-            }
+            conn.query_one_sql(&tsql, &params).await?.map(|(total,)| total).unwrap_or(0)
         };
 
-        let list = conn.query_all_sql(psql, params, Self::row_map).await?;
+        let list = conn.query_all_sql(psql, params, |(
+            permission_id,
+            group_code,
+            permission_code,
+            permission_name,
+            updated_time,
+            group_name,
+        )| SysPermissionVo {
+            inner: SysPermission {
+                permission_id,
+                group_code,
+                permission_code,
+                permission_name,
+                updated_time,
+            },
+            group_name,
+        }).await?;
 
         Ok(PageData { total, list, })
     }
 
     /// 查询permission_code最大值
-    pub async fn select_max_code() -> Result<Option<u16>> {
+    pub async fn select_max_code() -> Result<Option<i16>> {
         let (sql, params) = gensql::SelectSql::new()
             .select(&format_compact!("max({})", Self::PERMISSION_CODE))
             .from(Self::TABLE)
@@ -76,9 +106,12 @@ impl SysPermission {
 
     /// 加载所有记录
     pub async fn select_all() -> Result<Vec<SysPermission>> {
-        Self::select_page(&SysPermission::default(), PageInfo::new())
-            .await
-            .map(|v| v.list)
+        let (psql, params) = gensql::SelectSql::new()
+            .select_slice("", Self::FIELDS)
+            .from(Self::TABLE)
+            .order_by("", Self::PERMISSION_CODE)
+            .build();
+        query_all_sql(psql, params, Self::row_map).await
     }
 
     pub async fn rearrange(value: &[SysPermissionRearrange]) -> Result<()> {
@@ -116,7 +149,7 @@ impl SysPermission {
                     || format!("权限组[code = {}]丢失", item.group_code))?;
 
             // 记录字典表权限组的权限组代码变化
-            new_dict_list.push((dict.dict_id.unwrap(), new_group_code as u16));
+            new_dict_list.push((dict.dict_id.unwrap(), new_group_code as i16));
 
             if item.permission_codes.is_empty() { continue }
 
@@ -128,7 +161,7 @@ impl SysPermission {
 
                 // 更新权限的权限组代码及权限代码
                 new_permission_list.push((permission.permission_id.unwrap(),
-                        new_group_code as u16, new_permission_code as u16));
+                        new_group_code as i16, new_permission_code as i16));
 
                 // 更新角色的权限(旧的权限位置移动到新的位置)
                 for (role, role_p) in role_list.iter()
@@ -139,16 +172,16 @@ impl SysPermission {
                 }
 
                 // 更新权限关联的api
-                if let Some(sub_api_list) = api_map.get(&(*pcode as i32)) {
+                if let Some(sub_api_list) = api_map.get(&*pcode) {
                     for item in sub_api_list.iter() {
-                        new_api_list.push((item.api_id.unwrap(), new_permission_code as i32));
+                        new_api_list.push((item.api_id.unwrap(), new_permission_code as i16));
                     }
                 }
 
                 // 更新权限关联的菜单
-                if let Some(sub_menu_list) = menu_map.get(&(*pcode as i32)) {
+                if let Some(sub_menu_list) = menu_map.get(&*pcode) {
                     for item in sub_menu_list.iter() {
-                        new_menu_list.push((item.menu_id.unwrap(), new_permission_code as i32));
+                        new_menu_list.push((item.menu_id.unwrap(), new_permission_code as i16));
                     }
                 }
 
@@ -197,9 +230,7 @@ impl SysPermission {
         map
     }
 
-    async fn update_dicts(conn: &mut Transaction<'_>,
-            list: &[(u32, u16)]) -> Result<()> {
-
+    async fn update_dicts(conn: &mut Transaction<'_>, list: &[(u32, i16)]) -> Result<()> {
         type D = SysDict;
         let sql = format!("update {} set {} = ?, {} = ? where {} = ?",
                 D::TABLE, D::DICT_CODE, D::UPDATED_TIME, D::DICT_ID);
@@ -214,8 +245,7 @@ impl SysPermission {
         Ok(())
     }
 
-    async fn update_permissions(conn: &mut Transaction<'_>,
-            list: &[(u32, u16, u16)]) -> Result<()> {
+    async fn update_permissions(conn: &mut Transaction<'_>, list: &[(u32, i16, i16)]) -> Result<()> {
 
         type T = SysPermission;
         let sql = format!("update {} set {} = ?, {} = ?, {} = ? where {} = ?",
@@ -232,8 +262,7 @@ impl SysPermission {
         Ok(())
     }
 
-    async fn update_apis(conn: &mut Transaction<'_>,
-            list: &[(u32, i32)]) -> Result<()> {
+    async fn update_apis(conn: &mut Transaction<'_>, list: &[(u32, i16)]) -> Result<()> {
 
         type A = SysApi;
         let sql = format!("update {} set {} = ?, {} = ? where {} = ?",
@@ -249,8 +278,7 @@ impl SysPermission {
         Ok(())
     }
 
-    async fn update_menus(conn: &mut Transaction<'_>,
-            list: &[(u32, i32)]) -> Result<()> {
+    async fn update_menus(conn: &mut Transaction<'_>, list: &[(u32, i16)]) -> Result<()> {
 
         type T = SysMenu;
         let sql = format!("update {} set {} = ?, {} = ? where {} = ?",

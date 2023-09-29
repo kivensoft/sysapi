@@ -2,51 +2,81 @@ use anyhow::Result;
 use compact_str::format_compact;
 use gensql::{table_define, Transaction, get_conn, query_one_sql, query_all_sql, Queryable};
 use localtime::LocalTime;
+use serde::{Serialize, Deserialize};
 
 use super::{PageData, PageInfo};
 
 pub enum DictType {
-    _DictClass,
+    DictClass,
     PermissionGroup,
-    _ClientType,
+    ClientType,
 }
 
 table_define!("t_sys_dict", SysDict,
     dict_id:        u32       => DICT_ID,
     dict_type:      u16       => DICT_TYPE,
-    dict_code:      u16       => DICT_CODE,
+    dict_code:      i16       => DICT_CODE,
     dict_name:      String    => DICT_NAME,
     updated_time:   LocalTime => UPDATED_TIME,
 );
 
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SysDictVo {
+    #[serde(flatten)]
+    inner: SysDict,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dict_type_name: Option<String>,
+}
+
+const DICT_TYPE_NAME: &str = "dict_type_name";
+
 impl SysDict {
     /// 查询记录
-    pub async fn select_page(value: &SysDict, page: PageInfo) -> Result<PageData<SysDict>> {
-        let (tsql, psql, params) = gensql::SelectSql::with_page(page.index, page.size)
-            .select_slice("", &Self::fields())
-            .from(Self::TABLE)
+    pub async fn select_page(value: &SysDict, page: PageInfo) -> Result<PageData<SysDictVo>> {
+        const T: &str = "t";
+        const T1: &str = "t1";
+
+        let (tsql, psql, params) = gensql::SelectSql::new()
+            .select_slice(T, Self::FIELDS)
+                .select_as(T1, Self::DICT_NAME, DICT_TYPE_NAME)
+            .from_alias(Self::TABLE, T)
+            .left_join(Self::TABLE, T1)
+                .on_eq(T1, Self::DICT_CODE, T, Self::DICT_TYPE)
+                .on_eq_val(T1, Self::DICT_TYPE, &(DictType::DictClass as u16))
             .where_sql()
-            .and_eq_opt("", Self::DICT_TYPE, &value.dict_type)
-            .and_eq_opt("", Self::DICT_CODE, &value.dict_code)
-            .and_like_opt("", Self::DICT_NAME, &value.dict_name)
-            .end_where()
-            .build_with_page()?;
+                .eq_opt(T, Self::DICT_TYPE, &value.dict_type)
+                .eq_opt(T, Self::DICT_CODE, &value.dict_code)
+                .like_opt(T, Self::DICT_NAME, &value.dict_name)
+                .end_where()
+            .build_with_page(page.index, page.size, page.total)?;
 
         let mut conn = get_conn().await?;
 
         let total = if tsql.is_empty() {
-            0
+            page.total.unwrap_or(0)
         } else {
-            match page.total {
-                Some(total) => total,
-                None => conn.query_one_sql(tsql, params.clone())
-                        .await?
-                        .map(|(total,)| total)
-                        .unwrap_or(0)
-            }
+            conn.query_one_sql(&tsql, &params).await?.map(|(total,)| total).unwrap_or(0)
         };
 
-        let list = conn.query_all_sql(psql, params, Self::row_map).await?;
+        let list = conn.query_all_sql(psql, params, |(
+            dict_id,
+            dict_type,
+            dict_code,
+            dict_name,
+            updated_time,
+            dict_type_name,
+        )| SysDictVo {
+            inner: SysDict {
+                dict_id,
+                dict_type,
+                dict_code,
+                dict_name,
+                updated_time,
+            },
+            dict_type_name,
+        }).await?;
 
         Ok(PageData { total, list, })
     }
@@ -54,22 +84,23 @@ impl SysDict {
     /// 返回指定类型的所有字典项
     pub async fn select_by_type(dict_type: u16) -> Result<Vec<SysDict>> {
         let (sql, params) = gensql::SelectSql::new()
-            .select_slice("", &Self::fields())
+            .select_slice("", Self::FIELDS)
             .from(Self::TABLE)
             .where_sql()
-            .and_eq("", Self::DICT_TYPE, &dict_type)
+            .eq("", Self::DICT_TYPE, &dict_type)
             .end_where()
+            .order_by("", Self::DICT_CODE)
             .build();
         query_all_sql(&sql, &params, Self::row_map).await
     }
 
     /// 查询指定类型的dict_code最大值
-    pub async fn select_max_code(dict_type: u16) -> Result<Option<u16>> {
+    pub async fn select_max_code(dict_type: u16) -> Result<Option<i16>> {
         let (sql, params) = gensql::SelectSql::new()
             .select(&format_compact!("max({})", Self::DICT_CODE))
             .from(Self::TABLE)
             .where_sql()
-            .and_eq("", Self::DICT_TYPE, &dict_type)
+            .eq("", Self::DICT_TYPE, &dict_type)
             .end_where()
             .build();
 
@@ -123,7 +154,7 @@ impl SysDict {
     }
 
     async fn my_update_dict(conn: &mut Transaction<'_>, id: Option<u32>,
-            code: u16, name: Option<String>, dict: &mut SysDict) -> Result<()> {
+            code: i16, name: Option<String>, dict: &mut SysDict) -> Result<()> {
 
         dict.dict_id = id;
         dict.dict_code = Some(code);
@@ -135,7 +166,7 @@ impl SysDict {
     }
 
     async fn my_insert_dict(conn: &mut Transaction<'_>,
-            code: u16, name: &str, dict: &mut SysDict) -> Result<()> {
+            code: i16, name: &str, dict: &mut SysDict) -> Result<()> {
 
         dict.dict_code = Some(code);
         dict.dict_name = Some(name.to_owned());

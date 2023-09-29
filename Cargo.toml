@@ -1,4 +1,5 @@
 # cargo build --release --target=x86_64-unknown-linux-musl
+# cargo test -- --nocapture utils::unix_crypt::tests::test_rand_password
 [package]
 name = "sysapi"
 version = "0.7.5"

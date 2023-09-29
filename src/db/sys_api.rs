@@ -3,13 +3,13 @@ use gensql::{table_define, get_conn, query_all_sql, vec_value, Queryable};
 use localtime::LocalTime;
 use serde::{Serialize, Deserialize};
 
-use crate::{db::sys_dict::SysDict, services::rmq};
+use crate::{db::sys_dict::SysDict, services::rmq, utils};
 
 use super::{PageData, PageInfo, sys_dict::DictType, sys_permission::SysPermission};
 
 table_define!("t_sys_api", SysApi,
     api_id:             u32       => API_ID,
-    permission_code:    i32       => PERMISSION_CODE,
+    permission_code:    i16       => PERMISSION_CODE,
     api_path:           String    => API_PATH,
     api_remark:         String    => API_REMARK,
     updated_time:       LocalTime => UPDATED_TIME,
@@ -17,21 +17,33 @@ table_define!("t_sys_api", SysApi,
 
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct SysApiExt {
+pub struct SysApiVo {
     #[serde(flatten)]
     pub inner: SysApi,
+
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub group_code: Option<i32>,
+    pub group_code: Option<i16>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_name: Option<String>,
 }
+
+const GROUP_NAME: &str = "group_name";
 
 impl SysApi {
     /// 查询记录
-    pub async fn select_page(value: &SysApiExt, page: PageInfo) -> Result<PageData<SysApiExt>> {
+    pub async fn select_page(value: &SysApiVo, page: PageInfo) -> Result<PageData<SysApiVo>> {
         use compact_str::format_compact as fmt;
+        type T = SysApi;
         type P = SysPermission;
         type D = SysDict;
 
-        let dict_type = DictType::PermissionGroup as u16;
+        const T: &str = "t";
+        const P: &str = "p";
+        const D: &str = "d";
 
         let (mut group_code, mut pcode) = (None, None);
         if value.inner.permission_code.is_none() {
@@ -41,36 +53,32 @@ impl SysApi {
             }
         }
 
-        let (tsql, psql, params) = gensql::SelectSql::with_page(page.index, page.size)
-            .select_slice("t", &Self::fields())
-            .select_ext("p", P::GROUP_CODE)
-            .from_alias(Self::TABLE, "t")
-            .left_join(P::TABLE, "p")
-            .on_eq("p", P::PERMISSION_CODE, "t", Self::PERMISSION_CODE)
-            .left_join(D::TABLE, "d")
-            .on_eq("d", D::DICT_CODE, "p", P::GROUP_CODE)
-            .on_eq_val("d", D::DICT_TYPE, &dict_type)
+        let (tsql, psql, params) = gensql::SelectSql::new()
+            .select_slice(T, T::FIELDS)
+                .select_ext(P, P::GROUP_CODE)
+                .select_as(D, D::DICT_NAME, GROUP_NAME)
+                .select_ext(P, P::PERMISSION_NAME)
+            .from_alias(T::TABLE, T)
+            .left_join(P::TABLE, P)
+                .on_eq(P, P::PERMISSION_CODE, T, T::PERMISSION_CODE)
+            .left_join(D::TABLE, D)
+                .on_eq(D, D::DICT_CODE, P, P::GROUP_CODE)
+                .on_eq_val(D, D::DICT_TYPE, &(DictType::PermissionGroup as u16))
             .where_sql()
-            .and_eq_opt("t", Self::PERMISSION_CODE, &value.inner.permission_code)
-            .and_like_opt("t", Self::API_PATH, &value.inner.api_path)
-            .and_like_opt("t", Self::API_REMARK, &value.inner.api_remark)
-            .and_eq_opt("p", P::GROUP_CODE, &group_code)
-            .if_opt(&fmt!("t.{} < ?", P::PERMISSION_CODE), &pcode)
-            .end_where()
-            .build_with_page()?;
+                .eq_opt(T, T::PERMISSION_CODE, &value.inner.permission_code)
+                .like_opt(T, T::API_PATH, &value.inner.api_path)
+                .like_opt(T, T::API_REMARK, &value.inner.api_remark)
+                .eq_opt(P, P::GROUP_CODE, &group_code)
+                .if_opt(&fmt!("{}.{} < ?", T, T::PERMISSION_CODE), &pcode)
+                .end_where()
+            .build_with_page(page.index, page.size, page.total)?;
 
         let mut conn = get_conn().await?;
 
         let total = if tsql.is_empty() {
-            0
+            page.total.unwrap_or(0)
         } else {
-            match page.total {
-                Some(total) => total,
-                None => conn.query_one_sql(&tsql, &params)
-                        .await?
-                        .map(|(total,)| total)
-                        .unwrap_or(0),
-            }
+            conn.query_one_sql(&tsql, &params).await?.map(|(total,)| total).unwrap_or(0)
         };
 
         let list = conn.query_all_sql(psql, params, |(
@@ -80,15 +88,34 @@ impl SysApi {
                 api_remark,
                 updated_time,
                 group_code,
-            )| SysApiExt {
-                inner: SysApi {
-                    api_id,
-                    permission_code,
-                    api_path,
-                    api_remark,
-                    updated_time,
-                },
-                group_code,
+                group_name,
+                permission_name,
+            )| {
+                let mut res = SysApiVo {
+                    inner: SysApi {
+                        api_id,
+                        permission_code,
+                        api_path,
+                        api_remark,
+                        updated_time,
+                    },
+                    group_code,
+                    group_name,
+                    permission_name,
+                };
+                if let Some(c) = res.inner.permission_code {
+                    let p = match c {
+                        utils::ANONYMOUS_PERMIT_CODE => utils::ANONYMOUS_PERMIT_NAME,
+                        utils::PUBLIC_PERMIT_CODE => utils::PUBLIC_PERMIT_NAME,
+                        _ => "",
+                    };
+                    if !p.is_empty() {
+                        res.permission_name = Some(p.to_owned());
+                        res.group_name = Some(utils::INNER_GROUP_NAME.to_owned());
+                    }
+                }
+
+                res
             }).await?;
 
         Ok(PageData { total, list, })
@@ -97,7 +124,7 @@ impl SysApi {
     /// 加载所有记录
     pub async fn select_all() -> Result<Vec<SysApi>> {
         let (sql, params) = gensql::SelectSql::new()
-            .select_slice("", &Self::fields())
+            .select_slice("", Self::FIELDS)
             .from(Self::TABLE)
             .build();
         query_all_sql(&sql, &params, Self::row_map).await

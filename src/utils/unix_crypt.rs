@@ -52,28 +52,32 @@ pub fn rand_password(len: usize) -> String {
         b"abcdefghijklmnopqrstuvwxyz",
         b"ABDEFGHJLMNQRTY",
         b"23456789",
-        b"!@#$%&",
+        b"!@#$%&-+",
     ];
 
-    let mut cs = vec![b'0'; len];
+    assert!(len >= CHS.len());
+
+    let mut pwd = vec![b'*'; len];
     let mut rng = rand::thread_rng();
 
-    for item in cs.iter_mut() {
-        *item = CHS[0][rng.gen_range(0..CHS[0].len())];
-    }
-
-    let mut pos = usize::MAX;
     for item in CHS.iter().skip(1) {
-        pos = loop {
-            let p = rng.gen_range(0..item.len());
-            if p != pos {
+        let item_pos = rng.gen_range(0..item.len());
+        let pwd_pos = loop {
+            let p = rng.gen_range(0..pwd.len());
+            if pwd[p] == b'*' {
                 break p;
             }
         };
-        cs[pos] = item[pos];
+        pwd[pwd_pos] = item[item_pos];
     }
 
-    unsafe { String::from_utf8_unchecked(cs) }
+    for c in pwd.iter_mut() {
+        if *c == b'*' {
+            *c = CHS[0][rng.gen_range(0..CHS[0].len())];
+        }
+    }
+
+    unsafe { String::from_utf8_unchecked(pwd) }
 }
 
 fn gensalt(out: &mut [u8]) {
@@ -179,5 +183,17 @@ fn u8_to_b64(out: &mut [u8], b1: u8, b2: u8, b3: u8) {
     for item in out {
         *item = CRYPT_B64_CHARS[(w as usize) & 0x3F];
         w >>= 6;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::utils::unix_crypt::rand_password;
+
+    #[test]
+    fn test_rand_password() {
+        for _ in 0..10 {
+            println!("{}", rand_password(8))
+        }
     }
 }

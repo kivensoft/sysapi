@@ -10,7 +10,7 @@ cfg_if::cfg_if! {
 
 pub use serde;
 pub use db::{
-    Conn, Value, ToValue, Queryable, Transaction,
+    Conn, Row, Value, FromValue, ToValue, Queryable, Transaction,
     get_conn, try_connect, init_pool,
     exec_sql, insert_sql, query_all_sql, query_one_sql,
 };
@@ -52,6 +52,31 @@ macro_rules! option_struct {
     }
 }
 
+#[macro_export]
+macro_rules! struct_flatten {
+
+    ( $struct_name:ident, $parent_struct:ident,
+            $($field:ident : $f_type:ty => $field_name:ident,)+ ) => {
+
+        #[derive($crate::serde::Serialize, $crate::serde::Deserialize, Default, Debug, Clone)]
+        #[serde(rename_all = "camelCase")]
+        pub struct $struct_name {
+            #[serde(flatten)]
+            pub inner: $parent_struct,
+            $(
+                #[serde(skip_serializing_if = "Option::is_none")]
+                pub $field: Option<$f_type>,
+            )*
+        }
+
+        impl $struct_name {
+            $(
+                pub const $field_name: &str = stringify!($field);
+            )*
+        }
+    }
+}
+
 /// 创建数据库表的结构宏
 ///
 /// ## Examples
@@ -71,8 +96,11 @@ macro_rules! option_struct {
 #[macro_export]
 macro_rules! table_define {
 
-    ( $table_name:literal, $struct_name:ident, $id_name:ident: $id_type:tt => $id_alias:ident,
-            $($field:ident : $f_type:tt => $field_name:ident,)+ ) => {
+    (@unit $($x:tt)*) => (());
+    (@count $($x:expr),*) => (<[()]>::len(&[$($crate::table_define!(@unit $x)),*]));
+
+    ( $table_name:literal, $struct_name:ident, $id_name:ident: $id_type:ty => $id_alias:ident,
+            $($field:ident : $f_type:ty => $field_name:ident,)+ ) => {
 
         #[derive($crate::serde::Serialize, $crate::serde::Deserialize, Default, Debug, Clone)]
         #[serde(rename_all = "camelCase")]
@@ -92,6 +120,9 @@ macro_rules! table_define {
             $(
                 pub const $field_name: &str = stringify!($field);
             )*
+            pub const FIELDS: &[&'static str; $crate::table_define!(@count $id_name, $($field),*)] = &[
+                stringify!($id_alias), $(stringify!($field_name)),*
+            ];
 
             /// 删除记录
             pub async fn delete_by_id(id: &$id_type) -> Result<u32> {
@@ -251,15 +282,6 @@ macro_rules! table_define {
                 }
             }
 
-            pub fn fields() -> Vec<&'static str> {
-                vec![
-                    stringify!($id_name),
-                    $(
-                        stringify!($field),
-                    )*
-                ]
-            }
-
         }
 
     }
@@ -283,7 +305,6 @@ pub trait GeneratorSql {
 pub struct SelectSql {
     sql: Vec<u8>,
     params: Vec<Value>,
-    page: (u32, u32),
 }
 
 pub struct InsertSql {
@@ -358,17 +379,12 @@ impl GeneratorSql for SelectSql {
 impl SelectSql {
     #[inline]
     pub fn new() -> Self {
-        Self::with_page(0, 0)
-    }
-
-    pub fn with_page(pgae_index: u32, page_size: u32) -> Self {
         let mut sql = Vec::new();
         sql.extend_from_slice(b"select ");
 
         SelectSql {
             sql,
             params: Vec::new(),
-            page: (pgae_index, page_size),
         }
     }
 
@@ -385,6 +401,18 @@ impl SelectSql {
             self.sql.push(b'.');
         }
         self.sql.extend_from_slice(col.as_bytes());
+        self.sql.extend_from_slice(b", ");
+        self
+    }
+
+    pub fn select_as(mut self, table: &str, col: &str, col_alias: &str) -> Self {
+        if !table.is_empty() {
+            self.sql.extend_from_slice(table.as_bytes());
+            self.sql.push(b'.');
+        }
+        self.sql.extend_from_slice(col.as_bytes());
+        self.sql.push(b' ');
+        self.sql.extend_from_slice(col_alias.as_bytes());
         self.sql.extend_from_slice(b", ");
         self
     }
@@ -535,21 +563,26 @@ impl SelectSql {
         (sql, self.params)
     }
 
-    pub fn build_with_page(self) -> Result<(String, String, Vec<Value>), GenSqlError> {
+    pub fn build_with_page(self, pgae_index: u32, page_size: u32, total: Option<u32>) ->
+            Result<(String, String, Vec<Value>), GenSqlError> {
+
         let mut sql = unsafe { String::from_utf8_unchecked(self.sql) };
         let mut total_sql = String::new();
 
-        if self.page.0 > 0 && self.page.1 > 0 {
+        if pgae_index > 0 && page_size > 0 {
             let from_pos = match sql.find(" from ") {
                 Some(pos) => pos,
                 None => return Err(GenSqlError::UnsearchFrom),
             };
-            total_sql.push_str("select count(*)");
-            total_sql.push_str(&sql[from_pos..]);
+
+            if total.is_none() {
+                total_sql.push_str("select count(*)");
+                total_sql.push_str(&sql[from_pos..]);
+            }
 
             unsafe {
                 Self::set_limits(sql.as_mut_vec(),
-                    (self.page.0 - 1) * self.page.1, self.page.1);
+                    (pgae_index - 1) * page_size, page_size);
             }
         }
 
@@ -1030,76 +1063,76 @@ impl <T: GeneratorSql> WhereSql<T> {
     }
 
     #[inline]
-    pub fn and_eq<V: ToValue>(self, table: &str, col: &str, val: &V) -> Self {
+    pub fn eq<V: ToValue>(self, table: &str, col: &str, val: &V) -> Self {
         self.expr(AND, table, col, "=", val)
     }
 
     #[inline]
-    pub fn and_eq_if<V: ToValue>(self, pred: bool, table: &str, col: &str, val: &V) -> Self {
+    pub fn eq_if<V: ToValue>(self, pred: bool, table: &str, col: &str, val: &V) -> Self {
         if pred {
-            self.and_eq(table, col, val)
+            self.eq(table, col, val)
         } else {
             self
         }
     }
 
     #[inline]
-    pub fn and_eq_opt<V: ToValue>(self, table: &str, col: &str, val: &Option<V>) -> Self {
+    pub fn eq_opt<V: ToValue>(self, table: &str, col: &str, val: &Option<V>) -> Self {
         match val {
-            Some(val) => self.and_eq(table, col, val),
+            Some(val) => self.eq(table, col, val),
             None => self,
         }
     }
 
     #[inline]
-    pub fn and_eq_str<V: ToValue + AsRef<str>>(self, table: &str, col: &str, val: &Option<V>) -> Self {
+    pub fn eq_str<V: ToValue + AsRef<str>>(self, table: &str, col: &str, val: &Option<V>) -> Self {
         if let Some(val) = val {
             if !val.as_ref().is_empty() {
-                return self.and_eq(table, col, val);
+                return self.eq(table, col, val);
             }
         }
         self
     }
 
     #[inline]
-    pub fn and_like(self, table: &str, col: &str, val: &str) -> Self {
-        self.like(AND, table, col, LikeType::Full, val)
+    pub fn like(self, table: &str, col: &str, val: &str) -> Self {
+        self.inner_like(AND, table, col, LikeType::Full, val)
     }
 
-    pub fn and_like_opt<V: AsRef<str>>(self, table: &str, col: &str, val: &Option<V>) -> Self {
+    pub fn like_opt<V: AsRef<str>>(self, table: &str, col: &str, val: &Option<V>) -> Self {
         match val {
-            Some(val) => self.and_like(table, col, val.as_ref()),
+            Some(val) => self.like(table, col, val.as_ref()),
             None => self,
         }
     }
 
     #[inline]
-    pub fn and_like_right(self, table: &str, col: &str, val: &str) -> Self {
-        self.like(AND, table, col, LikeType::Right, val)
+    pub fn like_right(self, table: &str, col: &str, val: &str) -> Self {
+        self.inner_like(AND, table, col, LikeType::Right, val)
     }
 
-    pub fn and_like_right_opt<V: AsRef<str>>(self, table: &str, col: &str, val: &Option<V>) -> Self {
+    pub fn like_right_opt<V: AsRef<str>>(self, table: &str, col: &str, val: &Option<V>) -> Self {
         match val {
-            Some(val) => self.and_like_right(table, col, val.as_ref()),
+            Some(val) => self.like_right(table, col, val.as_ref()),
             None => self,
         }
     }
 
-    pub fn and_between<V: ToValue>(self, table: &str, col: &str, v1: &V, v2: &V) -> Self {
+    pub fn between<V: ToValue>(self, table: &str, col: &str, v1: &V, v2: &V) -> Self {
         let sql = format_compact!("and {}{} between ? and ?", _ta(table), col);
         self.add_slice(&sql, &vec![v1, v2])
     }
 
-    pub fn and_between_opt<V: ToValue>(self, table: &str, col: &str, v1: &Option<V>, v2: &Option<V>) -> Self {
+    pub fn between_opt<V: ToValue>(self, table: &str, col: &str, v1: &Option<V>, v2: &Option<V>) -> Self {
         if let (Some(v1), Some(v2)) = (v1, v2) {
-            self.and_between(table, col, v1, v2)
+            self.between(table, col, v1, v2)
         } else {
             self
         }
     }
 
     #[inline]
-    pub fn and_in<V: ToValue>(self, table: &str, col: &str, vals: &[V]) -> Self {
+    pub fn in_<V: ToValue>(self, table: &str, col: &str, vals: &[V]) -> Self {
         if !vals.is_empty() {
             let sql = format_compact!("and {}{} in", _ta(table), col);
             self.add_sql(&sql)
@@ -1110,9 +1143,9 @@ impl <T: GeneratorSql> WhereSql<T> {
     }
 
     #[inline]
-    pub fn and_in_opt<V: ToValue>(self, table: &str, col: &str, vals: &Option<Vec<V>>) -> Self {
+    pub fn in_opt<V: ToValue>(self, table: &str, col: &str, vals: &Option<Vec<V>>) -> Self {
         match vals {
-            Some(vals) => self.and_in(table, col, vals),
+            Some(vals) => self.in_(table, col, vals),
             None => self,
         }
     }
@@ -1122,7 +1155,7 @@ impl <T: GeneratorSql> WhereSql<T> {
         self.add_value(&sql, val)
     }
 
-    fn like(self, opera: &str, table: &str, col: &str, like_type: LikeType, val: &str) -> Self {
+    fn inner_like(self, opera: &str, table: &str, col: &str, like_type: LikeType, val: &str) -> Self {
         if val.is_empty() { return self; }
 
         let mut s = String::with_capacity(val.len() + 2);

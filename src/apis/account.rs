@@ -261,7 +261,7 @@ async fn check_auth_code(key_type: &str, key: &str, code: &str) -> Result<()> {
 
 fn get_user_menus<'a>(menus: &'a [SysMenu], permits: &str) -> Vec<&'a SysMenu> {
     let pbs = bits::string_to_bools(permits);
-    let pbs_len = pbs.len() as i32;
+    let pbs_len = pbs.len() as i16;
     let mut user_menus = Vec::new();
 
     for menu in menus {

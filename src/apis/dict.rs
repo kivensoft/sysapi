@@ -1,9 +1,8 @@
 //! 系统字典表接口
 
-use crate::{db::{PageQuery, sys_dict::SysDict}, services::rmq};
+use crate::{db::{PageQuery, sys_dict::SysDict, PageData}, services::rmq};
 use httpserver::{HttpContext, Resp, HttpResult, check_required, check_result};
 use localtime::LocalTime;
-use serde::Serialize;
 
 /// 记录列表
 pub async fn list(ctx: HttpContext) -> HttpResult {
@@ -93,17 +92,13 @@ pub async fn items(ctx: HttpContext) -> HttpResult {
         dict_type: u16,
     }
 
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Res {
-        dicts: Vec<SysDict>,
-    }
+    type Res = PageData<SysDict>;
 
     let param: Req = ctx.into_json().await?;
     let rec = SysDict::select_by_type(param.dict_type).await;
-    let rec = check_result!(rec);
+    let list = check_result!(rec);
 
-    Resp::ok(&Res { dicts: rec })
+    Resp::ok(&Res { total: list.len() as u32, list, })
 }
 
 /// 批量修改指定类型的字典项集合
