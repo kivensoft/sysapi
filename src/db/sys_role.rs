@@ -1,22 +1,22 @@
 use anyhow::Result;
-use gensql::{table_define, get_conn, Queryable, struct_flatten, query_all_sql};
+use gensql::{table_define, get_conn, Queryable, table_flatten, query_all_sql};
 use localtime::LocalTime;
 
 use crate::{db::sys_permission::SysPermission, utils::bits};
 
 use super::{PageData, PageInfo};
 
-table_define!("t_sys_role", SysRole,
-    role_id:      u32       => ROLE_ID,
-    role_type:    String    => ROLE_TYPE,
-    role_name:    String    => ROLE_NAME,
-    permissions:  String    => PERMISSIONS,
-    updated_time: LocalTime => UPDATED_TIME,
-);
+table_define!{"t_sys_role", SysRole,
+    role_id:      u32,
+    role_type:    String,
+    role_name:    String,
+    permissions:  String,
+    updated_time: LocalTime,
+}
 
-struct_flatten!(SysRoleVo, SysRole,
-    permission_names: Vec<String> => PERMISSION_NAMES,
-);
+table_flatten!{SysRoleVo, SysRole,
+    permission_names: Vec<String>,
+}
 
 impl SysRole {
     /// 查询记录

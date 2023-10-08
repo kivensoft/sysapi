@@ -1,8 +1,7 @@
 use anyhow::Result;
 use compact_str::format_compact;
-use gensql::{table_define, Transaction, get_conn, query_one_sql, query_all_sql, Queryable};
+use gensql::{table_define, Transaction, get_conn, query_one_sql, query_all_sql, Queryable, FastStr, table_flatten};
 use localtime::LocalTime;
-use serde::{Serialize, Deserialize};
 
 use super::{PageData, PageInfo};
 
@@ -12,25 +11,17 @@ pub enum DictType {
     ClientType,
 }
 
-table_define!("t_sys_dict", SysDict,
-    dict_id:        u32       => DICT_ID,
-    dict_type:      u16       => DICT_TYPE,
-    dict_code:      i16       => DICT_CODE,
-    dict_name:      String    => DICT_NAME,
-    updated_time:   LocalTime => UPDATED_TIME,
-);
-
-#[derive(Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct SysDictVo {
-    #[serde(flatten)]
-    inner: SysDict,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dict_type_name: Option<String>,
+table_define!{"t_sys_dict", SysDict,
+    dict_id:        u32,
+    dict_type:      u16,
+    dict_code:      i16,
+    dict_name:      FastStr,
+    updated_time:   LocalTime,
 }
 
-const DICT_TYPE_NAME: &str = "dict_type_name";
+table_flatten!{SysDictVo, SysDict,
+    dict_type_name: String,
+}
 
 impl SysDict {
     /// 查询记录
@@ -40,11 +31,12 @@ impl SysDict {
 
         let (tsql, psql, params) = gensql::SelectSql::new()
             .select_slice(T, Self::FIELDS)
-                .select_as(T1, Self::DICT_NAME, DICT_TYPE_NAME)
+                .select_as(T1, Self::DICT_NAME, SysDictVo::DICT_TYPE_NAME)
             .from_alias(Self::TABLE, T)
             .left_join(Self::TABLE, T1)
                 .on_eq(T1, Self::DICT_CODE, T, Self::DICT_TYPE)
                 .on_eq_val(T1, Self::DICT_TYPE, &(DictType::DictClass as u16))
+                .end_join()
             .where_sql()
                 .eq_opt(T, Self::DICT_TYPE, &value.dict_type)
                 .eq_opt(T, Self::DICT_CODE, &value.dict_code)
@@ -154,7 +146,7 @@ impl SysDict {
     }
 
     async fn my_update_dict(conn: &mut Transaction<'_>, id: Option<u32>,
-            code: i16, name: Option<String>, dict: &mut SysDict) -> Result<()> {
+            code: i16, name: Option<FastStr>, dict: &mut SysDict) -> Result<()> {
 
         dict.dict_id = id;
         dict.dict_code = Some(code);
@@ -169,7 +161,7 @@ impl SysDict {
             code: i16, name: &str, dict: &mut SysDict) -> Result<()> {
 
         dict.dict_code = Some(code);
-        dict.dict_name = Some(name.to_owned());
+        dict.dict_name = Some(FastStr::new(name));
 
         let (sql, params) = Self::stmt_insert(dict);
         conn.exec_sql(sql, params).await?;

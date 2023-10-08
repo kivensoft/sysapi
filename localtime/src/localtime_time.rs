@@ -167,7 +167,7 @@ impl <'de> Visitor<'de> for LocalTimeVisitor {
 
     // 必须重写的函数，用于为预期之外的类型提供错误信息
     fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
-        formatter.write_str("datetime format yyyy-MM-dd HH:mm:ss")
+        formatter.write_str("")
     }
 
     // 从字符串中反序列化

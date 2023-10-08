@@ -26,12 +26,12 @@ const APP_NAME: &str = "sysapi";
 const APP_VER: &str = include_str!(concat!(env!("OUT_DIR"), "/.version"));
 const SERVICE_PREFIX: &str = "/sys/";
 
-appconfig::appglobal_define!(app_global, AppGlobal,
+appconfig::appglobal_define!{app_global, AppGlobal,
     startup_time: i64,
     jwt_ttl: u32,
-);
+}
 
-appconfig::appconfig_define!(app_conf, AppConf,
+appconfig::appconfig_define!{app_conf, AppConf,
     log_level   : String => ["L",  "log-level",    "LogLevel",          "日志级别(trace/debug/info/warn/error/off)"],
     log_file    : String => ["F",  "log-file",     "LogFile",           "日志的相对路径或绝对路径文件名"],
     log_max     : String => ["M",  "log-max",      "LogFileMaxSize",    "日志文件的最大长度 (单位: k|m|g)"],
@@ -57,7 +57,7 @@ appconfig::appconfig_define!(app_conf, AppConf,
     jwt_iss     : String => ["",   "jwt-iss",      "JwtIss",            "令牌发行者"],
     jwt_ttl     : String => ["",   "jwt-ttl",      "JwtTtl",            "令牌存活时间 (单位: 分钟)"],
     jwt_refresh : String => ["",   "jwt-refresh",  "JwtRefresh",        "刷新令牌的密钥"],
-);
+}
 
 impl Default for AppConf {
     fn default() -> Self {
@@ -348,6 +348,7 @@ fn main() {
             }
         });
 
+        // 监听ctrl+c事件
         match signal::ctrl_c().await {
             Ok(()) => {
                 log::info!("关闭{APP_NAME}服务");

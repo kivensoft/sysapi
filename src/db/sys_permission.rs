@@ -2,9 +2,11 @@ use std::{collections::HashMap, hash::Hash};
 
 use anyhow::{Result, Context};
 use compact_str::format_compact;
-use gensql::{table_define, Transaction, get_conn, query_one_sql, vec_value, Queryable, query_all_sql};
+use gensql::{
+    Queryable, Transaction, get_conn, query_one_sql, query_all_sql,
+    table_define, vec_value, table_flatten
+};
 use localtime::LocalTime;
-use serde::{Serialize, Deserialize};
 
 use crate::{
     db::{
@@ -18,25 +20,17 @@ use crate::{
 
 use super::{PageData, PageInfo};
 
-table_define!("t_sys_permission", SysPermission,
-    permission_id:      u32       => PERMISSION_ID,
-    group_code:         i16       => GROUP_CODE,
-    permission_code:    i16       => PERMISSION_CODE,
-    permission_name:    String    => PERMISSION_NAME,
-    updated_time:       LocalTime => UPDATED_TIME,
-);
-
-#[derive(Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct SysPermissionVo {
-    #[serde(flatten)]
-    inner: SysPermission,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    group_name: Option<String>,
+table_define!{"t_sys_permission", SysPermission,
+    permission_id:      u32,
+    group_code:         i16,
+    permission_code:    i16,
+    permission_name:    String,
+    updated_time:       LocalTime,
 }
 
-const GROUP_NAME: &str = "group_name";
+table_flatten!{SysPermissionVo, SysPermission,
+    group_name: String,
+}
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,21 +42,24 @@ pub struct SysPermissionRearrange {
 impl SysPermission {
     /// 查询记录
     pub async fn select_page(value: &SysPermission, page: PageInfo) -> Result<PageData<SysPermissionVo>> {
+        type T = SysPermission;
+        type D = SysDict;
         const T: &str = "t";
-        const G: &str = "g";
+        const D: &str = "d";
 
         let (tsql, psql, params) = gensql::SelectSql::new()
-            .select_slice(T, Self::FIELDS)
-                .select_as(G, SysDict::DICT_NAME, GROUP_NAME)
-            .from_alias(Self::TABLE, T)
-            .left_join(SysDict::TABLE, G)
-                .on_eq(G, SysDict::DICT_CODE, T, Self::GROUP_CODE)
-                .on_eq_val(G, SysDict::DICT_TYPE, &(DictType::PermissionGroup as u16))
+            .select_slice(T, T::FIELDS)
+                .select_as(D, D::DICT_NAME, SysPermissionVo::GROUP_NAME)
+            .from_alias(T::TABLE, T)
+            .left_join(D::TABLE, D)
+                .on_eq(D, D::DICT_CODE, T, T::GROUP_CODE)
+                .on_eq_val(D, D::DICT_TYPE, &(DictType::PermissionGroup as u16))
+                .end_join()
             .where_sql()
-                .eq_opt(T, Self::GROUP_CODE, &value.group_code)
-                .like_opt(T, Self::PERMISSION_NAME, &value.permission_name)
+                .eq_opt(T, T::GROUP_CODE, &value.group_code)
+                .like_opt(T, T::PERMISSION_NAME, &value.permission_name)
                 .end_where()
-            .order_by(T, Self::PERMISSION_CODE)
+            .order_by(T, T::PERMISSION_CODE)
             .build_with_page(page.index, page.size, page.total)?;
 
         let mut conn = get_conn().await?;

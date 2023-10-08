@@ -1,37 +1,24 @@
 use anyhow::Result;
-use gensql::{table_define, get_conn, query_all_sql, vec_value, Queryable};
+use gensql::{table_define, get_conn, query_all_sql, vec_value, Queryable, FastStr, table_flatten};
 use localtime::LocalTime;
-use serde::{Serialize, Deserialize};
 
 use crate::{db::sys_dict::SysDict, services::rmq, utils};
 
 use super::{PageData, PageInfo, sys_dict::DictType, sys_permission::SysPermission};
 
-table_define!("t_sys_api", SysApi,
-    api_id:             u32       => API_ID,
-    permission_code:    i16       => PERMISSION_CODE,
-    api_path:           String    => API_PATH,
-    api_remark:         String    => API_REMARK,
-    updated_time:       LocalTime => UPDATED_TIME,
-);
-
-#[derive(Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct SysApiVo {
-    #[serde(flatten)]
-    pub inner: SysApi,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub group_code: Option<i16>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub group_name: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub permission_name: Option<String>,
+table_define!{"t_sys_api", SysApi,
+    api_id:             u32,
+    permission_code:    i16,
+    api_path:           FastStr,
+    api_remark:         FastStr,
+    updated_time:       LocalTime,
 }
 
-const GROUP_NAME: &str = "group_name";
+table_flatten!{SysApiVo, SysApi,
+    group_code:      i16,
+    group_name:      FastStr,
+    permission_name: FastStr,
+}
 
 impl SysApi {
     /// 查询记录
@@ -56,14 +43,16 @@ impl SysApi {
         let (tsql, psql, params) = gensql::SelectSql::new()
             .select_slice(T, T::FIELDS)
                 .select_ext(P, P::GROUP_CODE)
-                .select_as(D, D::DICT_NAME, GROUP_NAME)
+                .select_as(D, D::DICT_NAME, SysApiVo::GROUP_NAME)
                 .select_ext(P, P::PERMISSION_NAME)
             .from_alias(T::TABLE, T)
             .left_join(P::TABLE, P)
                 .on_eq(P, P::PERMISSION_CODE, T, T::PERMISSION_CODE)
+                .end_join()
             .left_join(D::TABLE, D)
                 .on_eq(D, D::DICT_CODE, P, P::GROUP_CODE)
                 .on_eq_val(D, D::DICT_TYPE, &(DictType::PermissionGroup as u16))
+                .end_join()
             .where_sql()
                 .eq_opt(T, T::PERMISSION_CODE, &value.inner.permission_code)
                 .like_opt(T, T::API_PATH, &value.inner.api_path)
@@ -110,8 +99,8 @@ impl SysApi {
                         _ => "",
                     };
                     if !p.is_empty() {
-                        res.permission_name = Some(p.to_owned());
-                        res.group_name = Some(utils::INNER_GROUP_NAME.to_owned());
+                        res.permission_name = Some(FastStr::new(p));
+                        res.group_name = Some(FastStr::new(utils::INNER_GROUP_NAME));
                     }
                 }
 

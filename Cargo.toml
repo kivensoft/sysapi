@@ -41,19 +41,19 @@ cfg-if = "1.0" # 条件编译宏
 # chrono = { version = "0.4", features = ["serde"] } # 最流行的日期时间库
 time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde"] } # 官方推荐的日期时间库
 async-trait = "0.1" # trait的异步函数声明库
-futures = "0.3"
-futures-util = "0.3"
+futures = "0.3" # 异步编程的官方库
+futures-util = "0.3" # 异步扩展库
 compact_str = { version = "0.7", features = ["serde", "bytes"] } # 短字符串存储在栈中的string替代品
 lazy_static = "1.4" # 广泛被使用的静态变量初始化库
 parking_lot = "0.12" # 性能更好的替代标准库Mutex/RwLock的三方库
-triomphe = "0.1" # 比标准库的Arc更轻量的替代类
+rclite = "0.2" # 比标准库的Arc更轻量的替代类
 rand = "0.8" # 最广泛使用的随机数生成库
 # mini-moka = "0.10" # 轻量的缓存库
 smallvec = { version = "1.10", features = ["write"] } # 基于栈的动态数组
 smallstr = "0.3" # 基于栈的字符串
 itoa = "1.0" # 非常快速的整数转字符串库
 lru = { version = "0.10", default-features = false } # 简单迷你的lru缓存库
-deadpool-redis = { version = "0.11" }
+deadpool-redis = { version = "0.11" } # redis 连接池
 flate2 = { version = "1.0", features = ["rust_backend"] }
 fast_qr = { version = "0.8", features = ["image"] }
 asynclog = { version = "1.0", path = "asynclog" } # 支持同步和异步两种方式的迷你日志实现库

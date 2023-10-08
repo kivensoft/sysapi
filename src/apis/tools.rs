@@ -54,7 +54,7 @@ pub async fn status(ctx: HttpContext) -> HttpResult {
 
     Resp::ok(&Res {
         startup: LocalTime::from_unix_timestamp(app_global.startup_time),
-        resp_count: ctx.id(),
+        resp_count: ctx.id,
         content_path: auth::API_PATH_PRE,
         app_name: crate::APP_NAME,
         app_ver: crate::APP_VER,

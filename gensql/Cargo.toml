@@ -7,7 +7,7 @@ description = "A simple sql generator library"
 
 [features]
 default = ["mysql"]
-mysql = ["mysql_common"]
+mysql = ["mysql_common", "mysql_async"]
 
 [dependencies]
 cfg-if = "1.0"
@@ -18,9 +18,10 @@ async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1.0", features = ["derive", "rc"] }
 parking_lot = "0.12"
-triomphe = "0.1"
+rclite = "0.2"
 mysql_common = { version = "0.29", optional = true }
-mysql_async = { version = "0.31", default-features = false }
+mysql_async = { version = "0.31", optional = true, default-features = false }
 itoa = "1.0"
 smallvec = { version = "1.10", features = ["write"] }
 compact_str = { version = "0.7", features = ["serde", "bytes"] }
+gensql_derive = { version = "1.0", path = "gensql_derive" } # sql语句生成库

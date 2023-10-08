@@ -1,0 +1,15 @@
+[package]
+name = "gensql_derive"
+version = "1.0.0"
+edition = "2021"
+authors = ["kiven <kivensoft@gmail.com>"]
+description = "gensql table derive"
+
+[lib]
+name = "gensql_derive"
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0"
+syn = { version = "2.0",features = ["full", "fold"] }
+quote = "1.0"

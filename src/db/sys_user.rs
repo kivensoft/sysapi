@@ -6,19 +6,19 @@ use crate::utils;
 
 use super::{PageData, PageInfo, sys_role::SysRole};
 
-table_define!("t_sys_user", SysUser,
-    user_id:        u32         => USER_ID,
-    role_id:        u32         => ROLE_ID,
-    icon_id:        String      => ICON_ID,
-    disabled:       u8          => DISABLED,
-    username:       String      => USERNAME,
-    password:       String      => PASSWORD,
-    nickname:       String      => NICKNAME,
-    mobile:         String      => MOBILE,
-    email:          String      => EMAIL,
-    updated_time:   LocalTime   => UPDATED_TIME,
-    created_time:   LocalTime   => CREATED_TIME,
-);
+table_define!{"t_sys_user", SysUser,
+    user_id:        u32,
+    role_id:        u32,
+    icon_id:        String,
+    disabled:       u8,
+    username:       String,
+    password:       String,
+    nickname:       String,
+    mobile:         String,
+    email:          String,
+    updated_time:   LocalTime,
+    created_time:   LocalTime,
+}
 
 impl SysUser {
     /// 查询记录
@@ -118,10 +118,11 @@ impl SysUser {
             .select_ext("r", R::PERMISSIONS)
             .from_alias(Self::TABLE, "t")
             .join(R::TABLE, "r")
-            .on_eq("t", Self::ROLE_ID, "r", R::ROLE_ID)
+                .on_eq("t", Self::ROLE_ID, "r", R::ROLE_ID)
+                .end_join()
             .where_sql()
-            .eq("t", Self::USER_ID, &id)
-            .end_where()
+                .eq("t", Self::USER_ID, &id)
+                .end_where()
             .build();
         query_one_sql(&sql, &params).await
     }

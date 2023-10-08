@@ -4,6 +4,7 @@ use crate::{
     db::{PageQuery, sys_api::{SysApi, SysApiVo}, sys_dict::{DictType, SysDict}, self, sys_permission::SysPermission, PageData},
     services::rmq, utils
 };
+use gensql::FastStr;
 use httpserver::{HttpContext, Resp, HttpResult, check_result};
 use localtime::LocalTime;
 
@@ -121,7 +122,7 @@ pub async fn groups(_ctx: HttpContext) -> HttpResult {
     let mut list = Vec::with_capacity(groups.len() + 1);
     list.push(SysDict {
         dict_code: Some(utils::INNER_GROUP_CODE),
-        dict_name: Some(utils::INNER_GROUP_NAME.to_owned()),
+        dict_name: Some(FastStr::new(utils::INNER_GROUP_NAME)),
         ..Default::default()
     });
     for item in groups.into_iter() {

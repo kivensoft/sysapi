@@ -1,6 +1,6 @@
 use anyhow::Result;
 use compact_str::format_compact;
-use gensql::{table_define, get_conn, query_one_sql, query_all_sql, row_map, vec_value, Queryable, Row, FromValue, struct_flatten};
+use gensql::{table_define, get_conn, query_one_sql, query_all_sql, row_map, vec_value, Queryable, Row, FromValue, table_flatten};
 use localtime::LocalTime;
 use tokio::sync::OnceCell;
 
@@ -10,30 +10,30 @@ use super::{PageData, PageInfo};
 
 static SUBSCRIBE_INIT: OnceCell<bool> = OnceCell::const_new();
 
-table_define!("t_sys_menu", SysMenu,
-    menu_id:            u32       => MENU_ID,
-    client_type:        u16       => CLIENT_TYPE,
-    menu_code:          String    => MENU_CODE,
-    permission_code:    i16       => PERMISSION_CODE,
-    menu_name:          String    => MENU_NAME,
-    menu_link:          String    => MENU_LINK,
-    menu_icon:          String    => MENU_ICON,
-    menu_desc:          String    => MENU_DESC,
-    updated_time:       LocalTime => UPDATED_TIME,
-);
+table_define!{"t_sys_menu", SysMenu,
+    menu_id:            u32,
+    client_type:        u16,
+    menu_code:          String,
+    permission_code:    i16,
+    menu_name:          String,
+    menu_link:          String,
+    menu_icon:          String,
+    menu_desc:          String,
+    updated_time:       LocalTime,
+}
 
-struct_flatten!(SysMenuVo, SysMenu,
-    client_type_name: String          => CLIENT_TYPE_NAME,
-    permission_name:  String          => PERMISSION_NAME,
+table_flatten!{SysMenuVo, SysMenu,
+    client_type_name: String,
+    permission_name:  String,
 
-    group_code:       i16             => GROUP_CODE,
-    group_name:       String          => GROUP_NAME,
+    group_code:       i16,
+    group_name:       String,
 
-    parent_menu_code: String          => PARENT_MENU_CODE,
-    parent_menu_name: String          => PARENT_MENU_NAME,
+    parent_menu_code: String,
+    parent_menu_name: String,
 
-    menus:            Vec<SysMenuVo> => MENUS,
-);
+    menus:            Vec<SysMenuVo>,
+}
 
 
 impl SysMenu {
@@ -61,15 +61,19 @@ impl SysMenu {
             .from_alias(Self::TABLE, T)
             .left_join(P::TABLE, P)
                 .on_eq(P, P::PERMISSION_CODE, T, T::PERMISSION_CODE)
+                .end_join()
             .left_join(T1::TABLE, T1)
                 .on(&format_compact!("{}.{} = left({}.{}, length({}.{}) - 2)",
                     T1, T1::MENU_CODE, T, T::MENU_CODE, T, T::MENU_CODE))
+                .end_join()
             .left_join(C::TABLE, C)
                 .on_eq(C, C::DICT_CODE, T, T::CLIENT_TYPE)
                 .on_eq_val(C, C::DICT_TYPE, &(DictType::ClientType as u16))
+                .end_join()
             .left_join(G::TABLE, G)
                 .on_eq(G, G::DICT_CODE, P, P::GROUP_CODE)
                 .on_eq_val(G, G::DICT_TYPE, &(DictType::PermissionGroup as u16))
+                .end_join()
             .where_sql()
                 .eq_opt(T, Self::CLIENT_TYPE, &value.client_type)
                 .eq_opt(T, Self::PERMISSION_CODE, &value.permission_code)

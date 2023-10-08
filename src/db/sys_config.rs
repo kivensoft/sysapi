@@ -1,17 +1,17 @@
 use anyhow::Result;
-use gensql::{table_define, get_conn, Queryable};
+use gensql::{table_define, get_conn, Queryable, FastStr};
 use localtime::LocalTime;
 
 use super::{PageData, PageInfo};
 
 
-table_define!("t_sys_config", SysConfig,
-    cfg_id:         u32         => CFG_ID,
-    cfg_name:       String      => CFG_NAME,
-    cfg_value:      String      => CFG_VALUE,
-    updated_time:   LocalTime   => UPDATED_TIME,
-    cfg_remark:     String      => CFG_REMARK,
-);
+table_define!{"t_sys_config", SysConfig,
+    cfg_id:         u32,
+    cfg_name:       FastStr,
+    cfg_value:      FastStr,
+    updated_time:   LocalTime,
+    cfg_remark:     FastStr,
+}
 
 impl SysConfig {
     /// 查询记录

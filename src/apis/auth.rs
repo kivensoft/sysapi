@@ -90,7 +90,7 @@ pub async fn logout(ctx: HttpContext) -> HttpResult {
     tokio::spawn(async move {
         let chan = rmq::make_channel(rmq::ChannelName::Logout);
         let msg = serde_json::to_string(&SysUser {
-                user_id: Some(ctx.uid()),
+                user_id: Some(ctx.uid),
                 ..Default::default()
             }).expect("json序列化失败");
 
@@ -111,7 +111,7 @@ pub async fn refresh(ctx: HttpContext) -> HttpResult {
 
     type Res = LoginRes;
 
-    let user_id = ctx.uid();
+    let user_id = ctx.uid;
     let token = get_auth_token(&ctx)?.to_owned();
     let param: Req = ctx.into_json().await?;
 

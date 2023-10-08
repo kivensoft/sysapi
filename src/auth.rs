@@ -8,7 +8,7 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use triomphe::Arc;
+use rclite::Arc;
 use std::{borrow::Cow, collections::HashMap, num::NonZeroUsize};
 
 use crate::{utils, services::rmq, db::{sys_user::SysUser, sys_role::SysRole, sys_api::SysApi}};
@@ -67,18 +67,18 @@ impl httpserver::HttpMiddleware for Authentication {
             log::trace!("校验 token: [{token}]");
             match decode_token(&token) {
                 // 解码token成功，将登录用户id写入ctx上下文环境
-                Ok(val) => ctx.set_uid(val),
+                Ok(val) => ctx.uid = val,
                 Err(e) => {
-                    log::error!("[{:08x}] AUTH verify token error: {:?}", ctx.id(), e);
+                    log::error!("[{:08x}] AUTH verify token error: {:?}", ctx.id, e);
                     anyhow::bail!("无效的令牌");
                 }
             }
         }
 
-        if auth(ctx.uid(), ctx.req.uri().path()).await {
+        if auth(ctx.uid, ctx.req.uri().path()).await {
             next.run(ctx).await
         }
-        else if ctx.uid() == 0 {
+        else if ctx.uid == 0 {
             log::trace!("权限校验失败[{}], 用户尚未登录", ctx.req.uri().path());
             Resp::fail_with_status(StatusCode::UNAUTHORIZED, 401, "Unauthorized")
         }
