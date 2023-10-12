@@ -2,7 +2,7 @@
 
 use std::slice::from_ref;
 use crate::{
-    db::{sys_user::SysUser, sys_role::SysRole, sys_menu::SysMenu},
+    entities::{sys_user::SysUser, sys_role::SysRole, sys_menu::SysMenu},
     services::rcache,
     AppConf,
     utils::{bits, md5_crypt},

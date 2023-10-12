@@ -11,7 +11,10 @@ use tokio::sync::Mutex;
 use rclite::Arc;
 use std::{borrow::Cow, collections::HashMap, num::NonZeroUsize};
 
-use crate::{utils, services::rmq, db::{sys_user::SysUser, sys_role::SysRole, sys_api::SysApi}};
+use crate::{
+    utils, services::rmq,
+    entities::{sys_user::SysUser, sys_role::SysRole, sys_api::SysApi}
+};
 
 pub const ACCESS_TOKEN: &str = "access_token";
 pub const COOKIE_NAME: &str = "Cookie";

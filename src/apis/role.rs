@@ -1,6 +1,6 @@
 //! 角色表接口
 
-use crate::{db::{PageQuery, sys_role::SysRole, PageData}, services::rmq};
+use crate::{entities::{PageQuery, sys_role::SysRole, PageData}, services::rmq};
 use httpserver::{HttpContext, Resp, HttpResult, check_required, check_result};
 use localtime::LocalTime;
 

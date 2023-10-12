@@ -9,7 +9,7 @@ use gensql::{
 use localtime::LocalTime;
 
 use crate::{
-    db::{
+    entities::{
         sys_dict::{SysDict, DictType},
         sys_api::SysApi,
         sys_menu::SysMenu,

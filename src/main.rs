@@ -1,6 +1,6 @@
 mod auth;
 mod apis;
-mod db;
+mod entities;
 mod services;
 mod utils;
 

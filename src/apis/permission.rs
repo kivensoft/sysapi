@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    db::{
+    entities::{
         PageQuery,
         sys_permission::{SysPermission, SysPermissionRearrange},
         sys_dict::{SysDict, DictType}, PageData

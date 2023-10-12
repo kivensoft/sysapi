@@ -4,7 +4,10 @@ use gensql::{table_define, get_conn, query_one_sql, query_all_sql, row_map, vec_
 use localtime::LocalTime;
 use tokio::sync::OnceCell;
 
-use crate::{AppConf, services::{rcache, rmq}, db::{sys_permission::SysPermission, sys_dict::{SysDict, DictType}}};
+use crate::{
+    AppConf, services::{rcache, rmq},
+    entities::{sys_permission::SysPermission, sys_dict::{SysDict, DictType}}
+};
 
 use super::{PageData, PageInfo};
 

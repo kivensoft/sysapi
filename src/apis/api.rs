@@ -1,7 +1,12 @@
 //! 系统接口权限管理
 
 use crate::{
-    db::{PageQuery, sys_api::{SysApi, SysApiVo}, sys_dict::{DictType, SysDict}, self, sys_permission::SysPermission, PageData},
+    entities::{
+        sys_api::{SysApi, SysApiVo},
+        sys_dict::{DictType, SysDict},
+        sys_permission::SysPermission,
+        PageQuery, PageData, self
+    },
     services::rmq, utils
 };
 use gensql::FastStr;
@@ -113,7 +118,7 @@ pub async fn rearrange(ctx: HttpContext) -> HttpResult {
 
 /// 返回权限组列表(带内置权限项)
 pub async fn groups(_ctx: HttpContext) -> HttpResult {
-    type Res = db::PageData<SysDict>;
+    type Res = entities::PageData<SysDict>;
 
     let groups = SysDict::select_by_type(DictType::PermissionGroup as u16).await;
     let groups = check_result!(groups);
@@ -134,7 +139,7 @@ pub async fn groups(_ctx: HttpContext) -> HttpResult {
 
 /// 返回权限列表(带内置权限项)
 pub async fn permissions(_ctx: HttpContext) -> HttpResult {
-    type Res = db::PageData<SysPermission>;
+    type Res = entities::PageData<SysPermission>;
 
     let apis = check_result!(SysPermission::select_all().await);
 

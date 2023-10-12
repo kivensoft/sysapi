@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    db::{PageQuery, sys_menu::{SysMenu, SysMenuVo}, PageData},
+    entities::{PageQuery, sys_menu::{SysMenu, SysMenuVo}, PageData},
     services::rmq
 };
 

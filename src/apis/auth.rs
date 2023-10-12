@@ -3,7 +3,7 @@
 use std::net::Ipv4Addr;
 use crate::{
     AppConf, AppGlobal, auth,
-    db::{sys_user::SysUser, sys_user_state::SysUserState},
+    entities::{sys_user::SysUser, sys_user_state::SysUserState},
     services::{rcache, rmq},
     utils,
 };

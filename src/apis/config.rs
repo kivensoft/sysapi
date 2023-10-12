@@ -1,6 +1,6 @@
 //! 系统配置接口
 
-use crate::{db::{sys_config::SysConfig, PageQuery}, services::rmq};
+use crate::{entities::{sys_config::SysConfig, PageQuery}, services::rmq};
 use httpserver::{HttpContext, Resp, HttpResult, check_required, check_result};
 use localtime::LocalTime;
 

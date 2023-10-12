@@ -1,6 +1,6 @@
 //! 系统字典表接口
 
-use crate::{db::{PageQuery, sys_dict::SysDict, PageData}, services::rmq};
+use crate::{entities::{PageQuery, sys_dict::SysDict, PageData}, services::rmq};
 use httpserver::{HttpContext, Resp, HttpResult, check_required, check_result};
 use localtime::LocalTime;
 

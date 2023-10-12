@@ -13,6 +13,23 @@ const PWD_LEN: usize = DIGEST_OFFSET + DIGEST_LEN;
 const CRYPT_B64_CHARS: &[u8] = b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 /// 口令加密
+///
+/// ### 算法描述：
+///     1. 生成6位随机字符并使用base64编码成8位随机字符作为"盐"
+///     2. 对("$74$" + "盐" + "口令")做md5运算得到"哈希值"
+///     3. 对"哈希值"进行base64编码转换成"哈希字符数组"
+///     4. 生成加密文本: "$74$" + "盐" + "$" + "哈希字符数组"
+///
+/// * 伪代码
+/// ```
+///     let base64_bytes: [u8; 64] = "./" + '0'..'9' + 'A'..'Z' + 'a'..'z';
+///     let rand_byte: [u8; 6] = rand6();
+///     let salt: [u8; 8] = base64(rand_byte);
+///     let hash_data: [u8; 16] = md5("$74$" + salt + password);
+///     let hash_str: [u8; 22] = base64(hash_data);
+///     let result: [u8; 35] = "$74$" + salt + "$" + hash_str;
+/// ```
+///
 pub fn encrypt(password: &str) -> Result<String> {
     let mut salt_base64 = [0; SALT_LEN];
 
@@ -111,23 +128,53 @@ fn do_encrypt(out: &mut [u8], password: &[u8], salt: &[u8]) {
 
     // 将 password 加密后的结果进行base64编码，并写入返回参数
     let fs = &mut out[DIGEST_OFFSET..];
-    for i in 0..5 {
-        let (i3, i4) = (i * 3, i * 4);
-        u8_to_b64(&mut fs[i4..i4+4], final_state[i3], final_state[i3+1],  final_state[i3+2]);
+    to_base64(fs, &final_state, &CRYPT_B64_CHARS);
+}
+
+fn to_base64(out: &mut [u8], input: &[u8], alphabet: &[u8]) -> usize {
+    let (align_step, noalign_count) = (input.len() / 3, input.len() % 3);
+    let write_count = align_step * 4 + match noalign_count {
+        0 => 0,
+        1 => 2,
+        2 => 3,
+        _ => unsafe { std::hint::unreachable_unchecked() }
+    };
+
+    assert!(out.len() >= write_count && alphabet.len() == 64);
+
+    let (mut in_ptr, mut out_ptr, ch_ptr) = (input.as_ptr(), out.as_mut_ptr(), alphabet.as_ptr());
+
+    // 处理读取长度为3字节对齐的情况
+    for _ in 0..align_step {
+        // 使用unsafe，避免访问数组元素时rust自动插入的越界检查代码
+        unsafe {
+            let (b1, b2, b3) = (*in_ptr, *in_ptr.add(1), *in_ptr.add(2));
+
+            *out_ptr = *ch_ptr.add((b1 >> 2) as usize);
+            *out_ptr.add(1) = *ch_ptr.add((b1 << 4 & 0x3f | b2 >> 4) as usize);
+            *out_ptr.add(2) = *ch_ptr.add((b2 << 2 & 0x3f | b3 >> 6) as usize);
+            *out_ptr.add(3) = *ch_ptr.add((b3 & 0x3f) as usize);
+
+            in_ptr = in_ptr.add(3);
+            out_ptr = out_ptr.add(4);
+        }
     }
-    u8_to_b64_1(&mut fs[20..22], final_state[15]);
-}
 
-fn u8_to_b64(out: &mut [u8], b1: u8, b2: u8, b3: u8) {
-    out[0] = CRYPT_B64_CHARS[(b1 >> 2) as usize];
-    out[1] = CRYPT_B64_CHARS[(((b1 << 4) & 0x3f) | (b2 >> 4)) as usize];
-    out[2] = CRYPT_B64_CHARS[(((b2 << 2) & 0x3f) | (b3 >> 6)) as usize];
-    out[3] = CRYPT_B64_CHARS[(b3 & 0x3f) as usize];
-}
+    // 处理剩余字节
+    if noalign_count != 0 {
+        unsafe {
+            let b1 = *in_ptr;
+            let b2 = if noalign_count > 1 { *in_ptr.add(1) } else { 0 };
 
-fn u8_to_b64_1(out: &mut [u8], b1: u8) {
-    out[0] = CRYPT_B64_CHARS[(b1 >> 2) as usize];
-    out[1] = CRYPT_B64_CHARS[((b1 << 4) & 0x3f) as usize];
+            *out_ptr = *ch_ptr.add((b1 >> 2) as usize);
+            *out_ptr.add(1) = *ch_ptr.add((b1 << 4 & 0x3f | b2 >> 4) as usize);
+            if noalign_count > 1 {
+                *out_ptr.add(2) = *ch_ptr.add((b2 << 2 & 0x3f) as usize);
+            }
+        }
+    }
+
+    write_count
 }
 
 #[cfg(test)]

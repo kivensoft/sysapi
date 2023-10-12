@@ -2,7 +2,7 @@ use anyhow::Result;
 use gensql::{table_define, get_conn, query_all_sql, vec_value, Queryable, FastStr, table_flatten};
 use localtime::LocalTime;
 
-use crate::{db::sys_dict::SysDict, services::rmq, utils};
+use crate::{entities::sys_dict::SysDict, services::rmq, utils};
 
 use super::{PageData, PageInfo, sys_dict::DictType, sys_permission::SysPermission};
 

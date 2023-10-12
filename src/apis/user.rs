@@ -1,6 +1,6 @@
 //! 用户表接口
 
-use crate::{db::{PageQuery, sys_user::SysUser}, utils::md5_crypt, services::rmq};
+use crate::{entities::{PageQuery, sys_user::SysUser}, utils::md5_crypt, services::rmq};
 use httpserver::{HttpContext, Resp, HttpResult, check_result};
 use localtime::LocalTime;
 use serde::Serialize;
