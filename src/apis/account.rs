@@ -5,7 +5,7 @@ use crate::{
     db::{sys_user::SysUser, sys_role::SysRole, sys_menu::SysMenu},
     services::rcache,
     AppConf,
-    utils::{bits, unix_crypt},
+    utils::{bits, md5_crypt},
 };
 use anyhow::Result;
 use compact_str::format_compact;
@@ -140,13 +140,13 @@ pub async fn change_password(ctx: HttpContext) -> HttpResult {
     };
 
     // 校验口令是否正确
-    if !unix_crypt::verify(&param.old_password, sys_user.password.as_ref().unwrap())? {
+    if !md5_crypt::verify(&param.old_password, sys_user.password.as_ref().unwrap())? {
         return Resp::fail("旧密码不正确");
     }
 
     let sys_user = SysUser {
         user_id: Some(user_id),
-        password: Some(unix_crypt::encrypt(&param.new_password)?),
+        password: Some(md5_crypt::encrypt(&param.new_password)?),
         updated_time: Some(LocalTime::now()),
         ..Default::default()
     };

@@ -1,6 +1,6 @@
 //! 实用工具接口
 
-use crate::{AppGlobal, utils::unix_crypt, auth};
+use crate::{AppGlobal, utils::md5_crypt, auth};
 use compact_str::{format_compact, CompactString, ToCompactString};
 use fast_qr::{
     convert::{image::ImageBuilder, Builder, Shape},
@@ -114,7 +114,7 @@ pub async fn gen_pass(ctx: HttpContext) -> HttpResult {
     type Res = Req;
 
     let param: Req = ctx.into_json().await?;
-    let digest = unix_crypt::encrypt(&param.pass)?;
+    let digest = md5_crypt::encrypt(&param.pass)?;
 
     Resp::ok(&Res {
         pass: CompactString::new(digest),

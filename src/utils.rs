@@ -4,7 +4,7 @@
 pub mod bits;
 #[allow(dead_code)]
 pub mod time;
-pub mod unix_crypt;
+pub mod md5_crypt;
 
 pub enum AccountType {
     Username,

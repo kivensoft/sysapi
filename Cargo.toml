@@ -56,10 +56,10 @@ lru = { version = "0.10", default-features = false } # 简单迷你的lru缓存�
 deadpool-redis = { version = "0.11" } # redis 连接池
 flate2 = { version = "1.0", features = ["rust_backend"] }
 fast_qr = { version = "0.8", features = ["image"] }
-asynclog = { version = "1.0", path = "asynclog" } # 支持同步和异步两种方式的迷你日志实现库
-appconfig = { version = "1.0", path = "appconfig", features = ["chinese"] } # 支持命令行参数解析和配置文件参数解析的库
-ansicolor = { version = "1.0", path = "ansicolor" } # 支持终端ansi颜色的库
+appconfig = { version = "1.0", git = "https://gitee.com/kivensoft/appconfig_rs.git" } # 支持命令行参数解析和配置文件参数解析的库
+ansicolor = { version = "1.0", git = "https://gitee.com/kivensoft/ansicolor_rs.git" } # 支持终端ansi颜色的库
+asynclog = { version = "1.0", git = "https://gitee.com/kivensoft/asynclog_rs.git" } # 支持同步和异步两种方式的迷你日志实现库
+localtime = { version = "1.0", git = "https://gitee.com/kivensoft/localtime_rs.git", features = ["mysql_common"] } # 本地时间序列化反序列化库
+jwt = { version = "1.0", git = "https://gitee.com/kivensoft/jwt_rs.git" } # 迷你的http库
 httpserver = { version = "1.0", path = "httpserver" } # 迷你的http库
-localtime = { version = "1.0", path = "localtime", features = ["mysql_common"] } # 本地时间序列化反序列化库
-jwt = { version = "1.0", path = "jwt" } # 迷你的http库
 gensql = { version = "1.0", path = "gensql" } # sql语句生成库

@@ -1,5 +1,4 @@
-//! Unix Crypt(3) 加密算法实现
-use std::cmp::min;
+//! MD5 Crypt(3) 自定义MD5加密算法实现
 
 use anyhow::Result;
 use md5::{Md5, Digest};
@@ -7,7 +6,7 @@ use rand::Rng;
 
 const SALT_LEN: usize = 8;
 const DIGEST_LEN: usize = 22;
-const SALT_MAGIC: &str = "$1$";
+const SALT_MAGIC: &str = "$74$";
 const DIGEST_OFFSET: usize = SALT_MAGIC.len() + SALT_LEN + 1;
 const PWD_LEN: usize = DIGEST_OFFSET + DIGEST_LEN;
 
@@ -52,7 +51,7 @@ pub fn rand_password(len: usize) -> String {
         b"abcdefghijklmnopqrstuvwxyz",
         b"ABDEFGHJLMNQRTY",
         b"23456789",
-        b"!@#$%&-+",
+        b"!@#$%^&-+",
     ];
 
     assert!(len >= CHS.len());
@@ -92,66 +91,12 @@ fn do_encrypt(out: &mut [u8], password: &[u8], salt: &[u8]) {
     // 加密方式 Uinx Md5Crypt
     debug_assert!(out.len() >= PWD_LEN && salt.len() == SALT_LEN);
 
-    // 计算 password + salt_prefix + salt 的 md5
+    // 计算 salt_prefix + salt + password 的 md5
     let mut hasher = Md5::new();
-    hasher.update(password);
     hasher.update(SALT_MAGIC.as_bytes());
     hasher.update(salt);
-
-    // 计算 password + salt + password 的 md5
-    let mut hasher1 = Md5::new();
-    hasher1.update(password);
-    hasher1.update(salt);
-    hasher1.update(password);
-    let mut final_state = hasher1.finalize();
-
-    let mut pwd_len = password.len();
-    while pwd_len > 0 {
-        hasher.update(&final_state[..min(pwd_len, 16)]);
-        pwd_len = pwd_len.saturating_sub(16)
-    }
-
-    final_state.fill(0);
-
-    pwd_len = password.len();
-    let (fs2, p2) = (&final_state[..1], &password[..1]);
-    while pwd_len > 0 {
-        if (pwd_len & 1) == 1 {
-            hasher.update(fs2);
-        } else {
-            hasher.update(p2);
-        }
-        pwd_len >>= 1;
-    }
-
-    let mut final_state = hasher.finalize();
-
-    // 循环1000次进行hash，别问我为什么这样实现，标准unix crypt(3)算法就是这么实现的
-    for i in 0..1000 {
-        let mut hasher2 = Md5::new();
-
-        if (i & 1) != 0 {
-            hasher2.update(password);
-        } else {
-            hasher2.update(&final_state[..16]);
-        }
-
-        if (i % 3) != 0 {
-            hasher2.update(salt);
-        }
-
-        if (i % 7) != 0 {
-            hasher2.update(password);
-        }
-
-        if (i & 1) != 0 {
-            hasher2.update(&final_state[..16]);
-        } else {
-            hasher2.update(password);
-        }
-
-        final_state = hasher2.finalize();
-    }
+    hasher.update(password);
+    let final_state = hasher.finalize();
 
     // 将 "$1$" 写入返回参数
     let fs = &mut out[..SALT_MAGIC.len()];
@@ -166,34 +111,44 @@ fn do_encrypt(out: &mut [u8], password: &[u8], salt: &[u8]) {
 
     // 将 password 加密后的结果进行base64编码，并写入返回参数
     let fs = &mut out[DIGEST_OFFSET..];
-    u8_to_b64(&mut fs[0..4],   final_state[0], final_state[6],  final_state[12]);
-    u8_to_b64(&mut fs[4..8],   final_state[1], final_state[7],  final_state[13]);
-    u8_to_b64(&mut fs[8..12],  final_state[2], final_state[8],  final_state[14]);
-    u8_to_b64(&mut fs[12..16], final_state[3], final_state[9],  final_state[15]);
-    u8_to_b64(&mut fs[16..20], final_state[4], final_state[10], final_state[5]);
-    u8_to_b64(&mut fs[20..22], 0,              0,               final_state[11]);
-
+    for i in 0..5 {
+        let (i3, i4) = (i * 3, i * 4);
+        u8_to_b64(&mut fs[i4..i4+4], final_state[i3], final_state[i3+1],  final_state[i3+2]);
+    }
+    u8_to_b64_1(&mut fs[20..22], final_state[15]);
 }
 
 fn u8_to_b64(out: &mut [u8], b1: u8, b2: u8, b3: u8) {
-    let mut w = (((b1 as u32) << 16) & 0x00FFFFFF)
-            | (((b2 as u32) << 8) & 0x00FFFF)
-            | ((b3 as u32) & 0xff);
+    out[0] = CRYPT_B64_CHARS[(b1 >> 2) as usize];
+    out[1] = CRYPT_B64_CHARS[(((b1 << 4) & 0x3f) | (b2 >> 4)) as usize];
+    out[2] = CRYPT_B64_CHARS[(((b2 << 2) & 0x3f) | (b3 >> 6)) as usize];
+    out[3] = CRYPT_B64_CHARS[(b3 & 0x3f) as usize];
+}
 
-    for item in out {
-        *item = CRYPT_B64_CHARS[(w as usize) & 0x3F];
-        w >>= 6;
-    }
+fn u8_to_b64_1(out: &mut [u8], b1: u8) {
+    out[0] = CRYPT_B64_CHARS[(b1 >> 2) as usize];
+    out[1] = CRYPT_B64_CHARS[((b1 << 4) & 0x3f) as usize];
 }
 
 #[cfg(test)]
 mod tests {
-    use super::rand_password;
+    use super::{rand_password, encrypt, verify};
 
     #[test]
     fn test_rand_password() {
         for _ in 0..10 {
             println!("{}", rand_password(8))
         }
+    }
+
+    #[test]
+    fn test_encrypt() {
+        println!("{}", encrypt("password").unwrap());
+    }
+
+    #[test]
+    fn test_verify() {
+        const ENC: &str = "$74$AtXyaPfN$72lU8lC7chwBrLucD4ZYD.";
+        assert!(verify("password", ENC).unwrap());
     }
 }

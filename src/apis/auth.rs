@@ -280,7 +280,7 @@ async fn get_user_by_account(account: &str) -> Result<SysUser> {
 /// 校验登录口令
 async fn check_password(account: &str, password: &str, pw_hash: &str) -> Result<()> {
     // 校验口令是否正确
-    if !utils::unix_crypt::verify(password, pw_hash)? {
+    if !utils::md5_crypt::verify(password, pw_hash)? {
         let cache_key = gen_fail_key(account);
         let count = rcache::incr(&cache_key, DISABLE_LOGIN_TTL as usize).await?;
         let n = MAX_FAIL_COUNT - count as u32;

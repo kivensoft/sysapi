@@ -1,6 +1,6 @@
 //! 用户表接口
 
-use crate::{db::{PageQuery, sys_user::SysUser}, utils::unix_crypt, services::rmq};
+use crate::{db::{PageQuery, sys_user::SysUser}, utils::md5_crypt, services::rmq};
 use httpserver::{HttpContext, Resp, HttpResult, check_result};
 use localtime::LocalTime;
 use serde::Serialize;
@@ -63,7 +63,7 @@ pub async fn post(ctx: HttpContext) -> HttpResult {
         None => {
             // 对口令进行加密
             httpserver::check_required!(param, password);
-            let pwd = check_result!(unix_crypt::encrypt(&param.password.unwrap()));
+            let pwd = check_result!(md5_crypt::encrypt(&param.password.unwrap()));
             param.password = Some(pwd);
 
             param.created_time = Some(LocalTime::now());
@@ -146,9 +146,9 @@ pub async fn reset_password(ctx: HttpContext) -> HttpResult {
 
     let pwd = match param.password {
         Some(v) => v,
-        None => unix_crypt::rand_password(8),
+        None => md5_crypt::rand_password(8),
     };
-    let enc_pwd = unix_crypt::encrypt(&pwd)?;
+    let enc_pwd = md5_crypt::encrypt(&pwd)?;
 
     let user = SysUser {
         user_id: param.user_id,

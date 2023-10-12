@@ -36,7 +36,7 @@ appconfig::appconfig_define!{app_conf, AppConf,
     log_file    : String => ["F",  "log-file",     "LogFile",           "日志的相对路径或绝对路径文件名"],
     log_max     : String => ["M",  "log-max",      "LogFileMaxSize",    "日志文件的最大长度 (单位: k|m|g)"],
     log_async   : bool   => ["",   "log-async",    "LogAsync",          "启用异步日志"],
-    no_console  : bool   => ["",   "log-max",      "NoConsole",         "禁止将日志输出到控制台"],
+    no_console  : bool   => ["",   "no-console",   "NoConsole",         "禁止将日志输出到控制台"],
     threads     : String => ["t",  "threads",      "Threads",           "设置应用的线程数"],
     listen      : String => ["l",  "listen",       "Listen",            "服务监听端点 (ip地址:端口号)"],
     gateway     : String => ["g",  "gateway",      "Gateway",           "api网关端点 (ip地址:端口号)"],
@@ -141,7 +141,7 @@ fn init() -> Option<(&'static mut AppConf, &'static mut AppGlobal)> {
 
     // 在控制台输出logo
     if let Some((s1, s2)) = BANNER.split_once('%') {
-        let s2 = &s2[s2.len() - 1..];
+        let s2 = &s2[APP_VER.len() - 1..];
         buf.clear();
         write!(buf, "{s1}{APP_VER}{s2}").unwrap();
         appconfig::print_banner(&buf, true);
