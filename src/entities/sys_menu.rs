@@ -141,7 +141,7 @@ impl SysMenu {
         // 首次运行时启动菜单变化的消息订阅处理函数
         SUBSCRIBE_INIT.get_or_init(|| async {
             let channel = rmq::make_channel(rmq::ChannelName::ModMenu);
-            let sub_succeed = rmq::subscribe(&channel, |_| async {
+            let chan_id = rmq::subscribe(channel, |_| async {
                 let cache_key_pre = format_compact!("{}:{}:*",
                         AppConf::get().cache_pre, rcache::CK_MENUS);
                 let keys = rcache::keys(&cache_key_pre).await?;
@@ -150,7 +150,7 @@ impl SysMenu {
                 Ok(())
             }).await.expect("订阅菜单变化频道失败");
 
-            if !sub_succeed {
+            if chan_id == 0 {
                 log::error!("订阅菜单变化频道失败: 该频道已经被订阅");
             }
 

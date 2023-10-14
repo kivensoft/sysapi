@@ -12,21 +12,9 @@ use rclite::Arc;
 use std::{borrow::Cow, collections::HashMap, num::NonZeroUsize};
 
 use crate::{
-    utils, services::rmq,
-    entities::{sys_user::SysUser, sys_role::SysRole, sys_api::SysApi}
+    entities::{sys_user::SysUser, sys_role::SysRole, sys_api::SysApi},
+    services::rmq, utils
 };
-
-pub const ACCESS_TOKEN: &str = "access_token";
-pub const COOKIE_NAME: &str = "Cookie";
-pub const API_PATH_PRE: &str = "/api"; // 接口请求的统一路径前缀, 权限判断时忽略该前缀
-
-const USER_ROLE_CACHE_SIZE: Option<NonZeroUsize> = NonZeroUsize::new(128); //USER_ROLE_CACHE的缓存大小
-
-type StaticShare<T> = Option<RwLock<Arc<T>>>;
-
-static mut ROLES: StaticShare<HashMap<u32, CompactString>> = None;
-static mut PERMITS: StaticShare<HashMap<CompactString, Vec<i16>>> = None;
-static mut USER_ROLE_CACHE: Option<Mutex<LruCache<u32, u32>>> = None;
 
 pub struct Authentication;
 
@@ -36,27 +24,30 @@ struct TokenBody {
     pub uid: u32,
 }
 
-macro_rules! get_global_value {
-    ($e: expr) => {
-        unsafe {
-            debug_assert!($e.is_some());
-            match $e.as_mut() {
-                Some(val) => val,
-                None => std::hint::unreachable_unchecked(),
-            }
-        }
-    };
+/// 全局静态变量
+struct GlobalVal {
+    roles: RwLock<Arc<HashMap<u32, CompactString>>>,
+    permits: RwLock<Arc<HashMap<CompactString, Vec<i16>>>>,
+    user_role_cache: Mutex<LruCache<u32, u32>>,
 }
+
+pub const ACCESS_TOKEN: &str = "access_token";
+pub const COOKIE_NAME: &str = "Cookie";
+pub const API_PATH_PRE: &str = "/api"; // 接口请求的统一路径前缀, 权限判断时忽略该前缀
+
+const USER_ROLE_CACHE_SIZE: Option<NonZeroUsize> = NonZeroUsize::new(128); //USER_ROLE_CACHE的缓存大小
+
+static mut GLOBAL_VAL: Option<GlobalVal> = None;
 
 /// 初始化全局对象数据, 必须在使用Authentication前调用
 pub async fn init() {
+    let roles = RwLock::new(Arc::new(load_roles().await.expect("加载角色列表错误")));
+    let permits = RwLock::new(Arc::new(load_permits().await.expect("加载权限路径列表错误")));
+    let user_role_cache = Mutex::new(LruCache::new(USER_ROLE_CACHE_SIZE.unwrap()));
+
     unsafe {
-        debug_assert!(ROLES.is_none());
-        ROLES = Some(RwLock::new(Arc::new(load_roles().await.expect("加载角色列表错误"))));
-        debug_assert!(PERMITS.is_none());
-        PERMITS = Some(RwLock::new(Arc::new(load_permits().await.expect("加载权限路径列表错误"))));
-        debug_assert!(USER_ROLE_CACHE.is_none());
-        USER_ROLE_CACHE = Some(Mutex::new(LruCache::new(USER_ROLE_CACHE_SIZE.unwrap())));
+        debug_assert!(GLOBAL_VAL.is_none());
+        GLOBAL_VAL = Some(GlobalVal { roles, permits, user_role_cache });
     }
 
     start_listen().await.expect("权限校验服务订阅数据变动监听事件失败");
@@ -66,14 +57,14 @@ pub async fn init() {
 impl httpserver::HttpMiddleware for Authentication {
     async fn handle<'a>(&'a self, mut ctx: HttpContext, next: Next<'a>,) -> HttpResult {
         // 解析token并, 设置userId
-        if let Some(token) = get_token(&ctx)? {
+        if let Some(token) = get_token(&ctx) {
             log::trace!("校验 token: [{token}]");
             match decode_token(&token) {
                 // 解码token成功，将登录用户id写入ctx上下文环境
                 Ok(val) => ctx.uid = val,
                 Err(e) => {
                     log::error!("[{:08x}] AUTH verify token error: {:?}", ctx.id, e);
-                    anyhow::bail!("无效的令牌");
+                    // anyhow::bail!("无效的令牌");
                 }
             }
         }
@@ -95,20 +86,22 @@ impl httpserver::HttpMiddleware for Authentication {
 
 /// 启动数据变化监听服务, 在用户/角色/权限表变化时重新载入
 async fn start_listen() -> Result<()> {
-    rmq::subscribe(&rmq::make_channel(rmq::ChannelName::ModRole), |_| async {
+    use rmq::{subscribe, make_channel, ChannelName};
+
+    subscribe(make_channel(ChannelName::ModRole), |_| async {
         let roles = load_roles().await.context("处理订阅消息[角色信息变化]失败")?;
-        *get_global_value!(ROLES).write() = Arc::new(roles);
+        *global_val().roles.write() = Arc::new(roles);
         Ok(())
     }).await?;
 
-    rmq::subscribe(&rmq::make_channel(rmq::ChannelName::ModApi), |_| async {
+    subscribe(make_channel(ChannelName::ModApi), |_| async {
         let permits = load_permits().await.context("处理订阅消息[路径权限信息变化]失败")?;
-        *get_global_value!(PERMITS).write() = Arc::new(permits);
+        *global_val().permits.write() = Arc::new(permits);
         Ok(())
     }).await?;
 
-    rmq::subscribe(&rmq::make_channel(rmq::ChannelName::ModUser), |_| async {
-        get_global_value!(USER_ROLE_CACHE).lock().await.clear();
+    subscribe(make_channel(ChannelName::ModUser), |_| async {
+        global_val().user_role_cache.lock().await.clear();
         log::trace!("处理消息订阅[用户表变化], 清除用户角色信息缓存完成");
         Ok(())
     }).await?;
@@ -118,7 +111,7 @@ async fn start_listen() -> Result<()> {
 
 /// 权限校验, 返回true表示有权访问, false表示无权访问
 pub async fn auth(uid: u32, mut path: &str) -> bool {
-    let permits = get_global_value!(PERMITS).read().clone();
+    let permits = global_val().permits.read().clone();
     let user_permits = get_user_permits(uid).await;
 
     // 忽略路径中的"/api"开头部分
@@ -159,9 +152,11 @@ pub async fn auth(uid: u32, mut path: &str) -> bool {
 
 /// 根据用户id加载用户权限
 async fn get_user_permits(uid: u32) -> CompactString {
-    if uid == 0 { return CompactString::new(""); }
+    if uid == 0 {
+        return CompactString::new("");
+    }
 
-    let mut rid = match get_global_value!(USER_ROLE_CACHE).lock().await.get(&uid) {
+    let mut rid = match global_val().user_role_cache.lock().await.get(&uid) {
         Some(v) => *v,
         None => 0,
     };
@@ -170,7 +165,7 @@ async fn get_user_permits(uid: u32) -> CompactString {
         rid = match SysUser::select_role_by_id(uid).await {
             Ok(v) => match v {
                 Some(n) => {
-                    get_global_value!(USER_ROLE_CACHE).lock().await.put(uid, n);
+                    global_val().user_role_cache.lock().await.put(uid, n);
                     n
                 },
                 None => 0,
@@ -182,7 +177,7 @@ async fn get_user_permits(uid: u32) -> CompactString {
         };
     }
 
-    match get_global_value!(ROLES).read().get(&rid) {
+    match global_val().roles.read().get(&rid) {
         Some(permits) => permits.clone(),
         None => CompactString::new(""),
     }
@@ -202,69 +197,85 @@ pub fn decode_token(token: &str) -> Result<u32> {
 }
 
 /// 从url参数或cookie中解析access_token
-fn get_token(ctx: &HttpContext) -> Result<Option<Cow<str>>> {
+fn get_token(ctx: &HttpContext) -> Option<Cow<str>> {
     match ctx.req.headers().get(jwt::AUTHORIZATION) {
         Some(auth) => match auth.to_str() {
             Ok(auth) => {
                 if auth.len() > jwt::BEARER.len() && auth.starts_with(jwt::BEARER) {
-                    Ok(Some(Cow::Borrowed(&auth[jwt::BEARER.len()..])))
+                    Some(Cow::Borrowed(&auth[jwt::BEARER.len()..]))
                 } else {
-                    anyhow::bail!("Authorization is not jwt token")
+                    log::warn!("Authorization is not jwt token");
+                    None
                 }
             }
-            Err(e) => anyhow::bail!("Authorization value is invalid: {e}"),
+            Err(e) => {
+                log::warn!("Authorization value is invalid: {e:?}");
+                None
+            },
         },
         None => get_access_token(ctx),
     }
 }
 
 /// 从url参数中解析access_token
-fn get_access_token(ctx: &HttpContext) -> Result<Option<Cow<str>>> {
+fn get_access_token(ctx: &HttpContext) -> Option<Cow<str>> {
     // 优先从url中获取access_token参数
     if let Some(query) = ctx.req.uri().query() {
         let url_params = querystring::querify(query);
         if let Some(param) = url_params.iter().find(|v| v.0 == ACCESS_TOKEN) {
             match urlencoding::decode(param.1) {
-                Ok(token) => return Ok(Some(token)),
-                Err(e) => anyhow::bail!("request uri query is not utf8 string: {}", e),
+                Ok(token) => return Some(token),
+                Err(e) => log::warn!("request uri query is not utf8 text: {e:?}"),
             }
         };
     };
 
     // url中找不到, 尝试从cookie中获取access_token
     if let Some(cookie_str) = ctx.req.headers().get(COOKIE_NAME) {
-        let cookie_str = match cookie_str.to_str() {
-            Ok(s) => s,
-            Err(e) => anyhow::bail!("cookie value is not utf8 string: {e:?}")
+        match cookie_str.to_str() {
+            Ok(c_str) => {
+                for cookie in Cookie::split_parse_encoded(c_str) {
+                    match cookie {
+                        Ok(c) => if c.name() == ACCESS_TOKEN {
+                            return Some(Cow::Owned(c.value().to_owned()));
+                        },
+                        Err(e) => log::warn!("cookie value [{}] parse encode error: {e:?}", c_str),
+                    }
+                }
+            },
+            Err(e) => log::warn!("cookie value is not utf8 text: {e:?}")
         };
-        for cookie in Cookie::split_parse_encoded(cookie_str) {
-            match cookie {
-                Ok(c) => if c.name() == ACCESS_TOKEN {
-                    return Ok(Some(Cow::Owned(c.value().to_owned())));
-                },
-                Err(e) => anyhow::bail!("cookie value [{cookie_str}] parse encode error: {e:?}"),
-            }
-        }
     }
 
-    Ok(None)
+    None
 }
 
 /// 校验用户访问许可是否在给定的索引列表内
 fn check_permit(uid: u32, permits: &str, ps: &[i16]) -> bool {
-    for i in ps.iter() {
+    for i in ps {
         match *i {
             utils::ANONYMOUS_PERMIT_CODE => return true,
             utils::PUBLIC_PERMIT_CODE => if uid != 0 {
                 return true
             },
-            index => if utils::bits::get(permits, index as usize) {
+            idx => if utils::bits::get(permits, idx as usize) {
                 return true
             },
         }
     }
 
     false
+}
+
+/// 获取全局变量的引用
+fn global_val() -> &'static GlobalVal {
+    unsafe {
+        debug_assert!(GLOBAL_VAL.is_some());
+        match &GLOBAL_VAL {
+            Some(val) => &val,
+            None => std::hint::unreachable_unchecked()
+        }
+    }
 }
 
 /// 从数据库中加载角色信息表, 返回所有角色id与对应的权限

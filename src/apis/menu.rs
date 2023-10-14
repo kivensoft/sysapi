@@ -4,7 +4,8 @@ use std::collections::HashMap;
 
 use crate::{
     entities::{PageQuery, sys_menu::{SysMenu, SysMenuVo}, PageData},
-    services::rmq
+    services::rmq::{ChannelName},
+    utils::pub_rec::{emit, RecChanged, type_from_id}
 };
 
 use anyhow::Result;
@@ -39,7 +40,6 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
 /// 更新单条记录
 pub async fn post(ctx: HttpContext) -> HttpResult {
     type Req = SysMenuVo;
-    type Res = SysMenu;
 
     let mut param: Req = ctx.into_json().await?;
 
@@ -79,19 +79,11 @@ pub async fn post(ctx: HttpContext) -> HttpResult {
         None => SysMenu::insert(&param.inner).await.map(|(_, id)| id),
     });
 
-    let typ = match param.inner.menu_id {
-        Some(_) => rmq::RecordChangedType::Update,
-        None => rmq::RecordChangedType::Insert,
-    };
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModMenu, typ, SysMenu {
-        menu_id: Some(id),
-        ..Default::default()
-    });
+    let res = SysMenu { menu_id: Some(id), ..Default::default() };
+    let type_ = type_from_id(&param.inner.menu_id);
+    emit(ChannelName::ModMenu, &RecChanged::new(type_, &res));
 
-    Resp::ok( &Res {
-        menu_id: Some(id),
-        ..Default::default()
-    })
+    Resp::ok(&res)
 }
 
 /// 删除记录
@@ -102,13 +94,10 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
     let op = SysMenu::delete_by_id(&param.id).await;
     check_result!(op);
 
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModMenu,
-        rmq::RecordChangedType::Delete,
-        SysMenu {
-            menu_id: Some(param.id),
-            ..Default::default()
-        }
-    );
+    emit(ChannelName::ModMenu, &RecChanged::with_delete(&SysMenu {
+        menu_id: Some(param.id),
+        ..Default::default()
+    }));
 
     Resp::ok_with_empty()
 }
@@ -172,9 +161,7 @@ pub async fn rearrange(ctx: HttpContext) -> HttpResult {
     tree_to_list(&mut list, "", &param);
     check_result!(SysMenu::batch_update_rearrange(&list).await);
 
-    rmq::publish_rec_change_spawm::<Option<()>>(rmq::ChannelName::ModMenu,
-        rmq::RecordChangedType::All, None);
-
+    emit(ChannelName::ModMenu, &RecChanged::<()>::with_all());
 
     Resp::ok_with_empty()
 }

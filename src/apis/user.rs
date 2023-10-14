@@ -1,6 +1,11 @@
 //! 用户表接口
 
-use crate::{entities::{PageQuery, sys_user::SysUser}, utils::md5_crypt, services::rmq};
+use crate::{
+    entities::{PageQuery, sys_user::SysUser},
+    utils::{md5_crypt, pub_rec::{emit, type_from_id, RecChanged}},
+    services::rmq::ChannelName
+};
+
 use httpserver::{HttpContext, Resp, HttpResult, check_result};
 use localtime::LocalTime;
 use serde::Serialize;
@@ -40,7 +45,6 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
 /// 更新单条记录
 pub async fn post(ctx: HttpContext) -> HttpResult {
     type Req = SysUser;
-    type Res = SysUser;
 
     let mut param: Req = ctx.into_json().await?;
 
@@ -72,20 +76,11 @@ pub async fn post(ctx: HttpContext) -> HttpResult {
         }
     });
 
-    let typ = match param.user_id {
-        Some(_) => rmq::RecordChangedType::Update,
-        None => rmq::RecordChangedType::Insert,
-    };
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModUser, typ, SysUser {
-        user_id: Some(id),
-        ..Default::default()
-    });
+    let res = SysUser { user_id: Some(id), ..Default::default() };
+    let type_ = type_from_id(&param.user_id);
+    emit(ChannelName::ModUser, &RecChanged::new(type_, &res));
 
-
-    Resp::ok( &Res {
-        user_id: Some(id),
-        ..Default::default()
-    })
+    Resp::ok(&res)
 }
 
 /// 删除记录
@@ -96,13 +91,10 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
     let op = SysUser::delete_by_id(&param.id).await;
     check_result!(op);
 
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModUser,
-        rmq::RecordChangedType::Delete,
-        SysUser {
-            user_id: Some(param.id),
-            ..Default::default()
-        }
-    );
+    emit(ChannelName::ModUser, &RecChanged::with_delete(&SysUser {
+        user_id: Some(param.id),
+        ..Default::default()
+    }));
 
     Resp::ok_with_empty()
 }
@@ -124,13 +116,10 @@ pub async fn change_disabled(ctx: HttpContext) -> HttpResult {
 
     SysUser::update_dyn_by_id(&user).await?;
 
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModUser,
-        rmq::RecordChangedType::Update,
-        SysUser {
-            user_id: param.user_id,
-            ..Default::default()
-        }
-    );
+    emit(ChannelName::ModUser, &RecChanged::with_update(&SysUser {
+        user_id: param.user_id,
+        ..Default::default()
+    }));
 
     Resp::ok_with_empty()
 }
@@ -159,13 +148,10 @@ pub async fn reset_password(ctx: HttpContext) -> HttpResult {
 
     SysUser::update_dyn_by_id(&user).await?;
 
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModUser,
-        rmq::RecordChangedType::Update,
-        SysUser {
-            user_id: param.user_id,
-            ..Default::default()
-        }
-    );
+    emit(ChannelName::ModUser, &RecChanged::with_update(&SysUser {
+        user_id: param.user_id,
+        ..Default::default()
+    }));
 
     Resp::ok( &Res {
         password: Some(pwd),

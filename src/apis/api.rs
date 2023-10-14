@@ -7,7 +7,8 @@ use crate::{
         sys_permission::SysPermission,
         PageQuery, PageData, self
     },
-    services::rmq, utils
+    services::rmq::{ChannelName},
+    utils::{self, pub_rec::{RecChanged, type_from_id, emit}}
 };
 use gensql::FastStr;
 use httpserver::{HttpContext, Resp, HttpResult, check_result};
@@ -39,7 +40,6 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
 /// 更新单条记录
 pub async fn post(ctx: HttpContext) -> HttpResult {
     type Req = SysApi;
-    type Res = SysApi;
 
     let mut param: Req = ctx.into_json().await?;
 
@@ -51,22 +51,11 @@ pub async fn post(ctx: HttpContext) -> HttpResult {
     };
     let id = check_result!(id);
 
-    tokio::spawn(async move {
-        let msg = SysApi { api_id: Some(id), ..Default::default() };
-        let chan = rmq::make_channel(rmq::ChannelName::ModApi);
-        let op = match param.api_id {
-            Some(_) => rmq::RecChanged::publish_update(&chan, msg).await,
-            None => rmq::RecChanged::publish_insert(&chan, msg).await,
-        };
-        if let Err(e) = op {
-            log::error!("redis发布消息失败: {e:?}");
-        }
-    });
+    let res = SysApi { api_id: Some(id), ..Default::default() };
+    let type_ = type_from_id(&param.api_id);
+    emit(ChannelName::ModApi, &RecChanged::new(type_, &res));
 
-    Resp::ok( &Res {
-        api_id: Some(id),
-        ..Default::default()
-    })
+    Resp::ok(&res)
 }
 
 /// 删除记录
@@ -77,16 +66,10 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
     let r = SysApi::delete_by_id(&param.id).await;
     check_result!(r);
 
-    tokio::spawn(async move {
-        let chan = rmq::make_channel(rmq::ChannelName::ModApi);
-        let op = rmq::RecChanged::publish_delete(&chan, SysApi {
-            api_id: Some(param.id),
-            ..Default::default()
-        }).await;
-        if let Err(e) = op {
-            log::error!("redis发布消息失败: {e:?}");
-        }
-    });
+    emit(ChannelName::ModApi, &RecChanged::with_delete(&SysApi {
+        api_id: Some(param.id),
+        ..Default::default()
+    }));
 
     Resp::ok_with_empty()
 }
@@ -112,6 +95,7 @@ pub async fn rearrange(ctx: HttpContext) -> HttpResult {
     }
 
     check_result!(SysApi::batch_update_permission_id(&param).await);
+    emit(ChannelName::ModApi, &RecChanged::<()>::with_all());
 
     Resp::ok_with_empty()
 }

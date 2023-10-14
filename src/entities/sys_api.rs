@@ -2,8 +2,7 @@ use anyhow::Result;
 use gensql::{table_define, get_conn, query_all_sql, vec_value, Queryable, FastStr, table_flatten};
 use localtime::LocalTime;
 
-use crate::{entities::sys_dict::SysDict, services::rmq, utils};
-
+use crate::{entities::sys_dict::SysDict, utils};
 use super::{PageData, PageInfo, sys_dict::DictType, sys_permission::SysPermission};
 
 table_define!{"t_sys_api", SysApi,
@@ -140,14 +139,6 @@ impl SysApi {
         }
 
         conn.commit().await?;
-
-        tokio::spawn(async move {
-            let chan = rmq::make_channel(rmq::ChannelName::ModApi);
-            let op = rmq::RecChanged::<SysApi>::publish_all(&chan).await;
-            if let Err(e) = op {
-                log::error!("redis发布消息失败: {e:?}");
-            }
-        });
 
         Ok(())
     }

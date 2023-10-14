@@ -7,18 +7,15 @@ use deadpool_redis::{redis::{self, FromRedisValue, Cmd}, Config, Connection, Poo
 pub const TTL_NOT_EXISTS: i32 = -2;
 #[allow(dead_code)]
 pub const TTL_NOT_EXPIRE: i32 = -1;
-
 /// 默认缓存过期时间(单位: 秒)
 pub const DEFAULT_TTL: u32 = 300;
-
 pub const CK_LOGIN_FAIL: &str = "loginFail";
 pub const CK_INVALID_TOKEN: &str = "invalidToken";
 pub const CK_MOBILE_AUTH_CODE: &str = "mobileAuthCode";
 pub const CK_EMAIL_AUTH_CODE: &str = "emailAuthCode";
 pub const CK_MENUS: &str = "menus";
 
-type CachePool = Option<Box<Pool>>;
-static mut CACHE_POOL: CachePool = None;
+static mut CACHE_POOL: Option<Pool> = None;
 
 /// 从缓冲池中获取一个redis客户端连接
 pub async fn get_conn() -> Result<Connection> {
@@ -39,40 +36,6 @@ pub async fn get_conn() -> Result<Connection> {
     }
 }
 
-fn gen_url(ac: &AppConf) -> String {
-    format!(
-        "redis://{}:{}@{}:{}/{}",
-        ac.cache_user, ac.cache_pass, ac.cache_host, ac.cache_port, ac.cache_name
-    )
-}
-
-// redis连接测试
-fn try_connect(url: &str) -> Result<()> {
-    let c = redis::Client::open(url)?;
-    let mut conn = c.get_connection()?;
-    let val: String = redis::cmd("PING").arg(crate::APP_NAME).query(&mut conn)?;
-    if val != crate::APP_NAME {
-        anyhow::bail!(format!("can't connect redis server: {url}"));
-    }
-
-    Ok(())
-}
-
-async fn query_async<T: FromRedisValue>(cmd: &Cmd) -> Result<T> {
-    let mut conn = get_conn().await?;
-    query_async2(&mut conn, cmd).await
-}
-
-async fn query_async2<T: FromRedisValue>(conn: &mut Connection, cmd: &Cmd) -> Result<T> {
-    match cmd.query_async(conn).await {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            log::error!("redis query async error: {e:?}");
-            anyhow::bail!("系统内部错误, 缓存操作失败")
-        }
-    }
-}
-
 pub fn init_pool(ac: &AppConf) -> Result<()> {
     debug_assert!(unsafe { CACHE_POOL.is_none() });
 
@@ -82,7 +45,7 @@ pub fn init_pool(ac: &AppConf) -> Result<()> {
     try_connect(&url)?;
 
     let cfg = Config::from_url(url);
-    let pool = Box::new(cfg.create_pool(Some(Runtime::Tokio1))?);
+    let pool = cfg.create_pool(Some(Runtime::Tokio1))?;
     unsafe {
         CACHE_POOL = Some(pool);
     }
@@ -138,4 +101,38 @@ pub async fn keys(key: &str) -> Result<Vec<String>> {
 pub async fn publish(channel: &str, message: &str) -> Result<()> {
     query_async(&Cmd::publish(channel, message)).await?;
     Ok(())
+}
+
+fn gen_url(ac: &AppConf) -> String {
+    format!(
+        "redis://{}:{}@{}:{}/{}",
+        ac.cache_user, ac.cache_pass, ac.cache_host, ac.cache_port, ac.cache_name
+    )
+}
+
+// redis连接测试
+fn try_connect(url: &str) -> Result<()> {
+    let c = redis::Client::open(url)?;
+    let mut conn = c.get_connection()?;
+    let val: String = redis::cmd("PING").arg(crate::APP_NAME).query(&mut conn)?;
+    if val != crate::APP_NAME {
+        anyhow::bail!(format!("can't connect redis server: {url}"));
+    }
+
+    Ok(())
+}
+
+async fn query_async<T: FromRedisValue>(cmd: &Cmd) -> Result<T> {
+    let mut conn = get_conn().await?;
+    query_async2(&mut conn, cmd).await
+}
+
+async fn query_async2<T: FromRedisValue>(conn: &mut Connection, cmd: &Cmd) -> Result<T> {
+    match cmd.query_async(conn).await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            log::error!("redis query async error: {e:?}");
+            anyhow::bail!("系统内部错误, 缓存操作失败")
+        }
+    }
 }

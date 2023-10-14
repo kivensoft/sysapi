@@ -1,6 +1,11 @@
 //! 系统字典表接口
 
-use crate::{entities::{PageQuery, sys_dict::SysDict, PageData}, services::rmq};
+use crate::{
+    entities::{PageQuery, sys_dict::SysDict, PageData},
+    services::rmq::ChannelName,
+    utils::pub_rec::{emit, RecChanged, type_from_id}
+};
+
 use httpserver::{HttpContext, Resp, HttpResult, check_required, check_result};
 use localtime::LocalTime;
 
@@ -49,15 +54,9 @@ pub async fn post(ctx: HttpContext) -> HttpResult {
         None => SysDict::insert(&param).await.map(|(_, id)| id),
     });
 
-    let typ = match param.dict_id {
-        Some(_) => rmq::RecordChangedType::Update,
-        None => rmq::RecordChangedType::Insert,
-    };
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModDict, typ, SysDict {
-        dict_id: Some(id),
-        ..Default::default()
-    });
-
+    let res = SysDict { dict_id: Some(id), ..Default::default() };
+    let type_ = type_from_id(&param.dict_id);
+    emit(ChannelName::ModDict, &RecChanged::new(type_, &res));
 
     Resp::ok( &Res {
         dict_id: Some(id),
@@ -73,13 +72,10 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
     let r = SysDict::delete_by_id(&param.id).await;
     check_result!(r);
 
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModDict,
-        rmq::RecordChangedType::Delete,
-        SysDict {
-            dict_id: Some(param.id),
-            ..Default::default()
-        }
-    );
+    emit(ChannelName::ModDict, &RecChanged::with_delete(&SysDict {
+        dict_id: Some(param.id),
+        ..Default::default()
+    }));
 
     Resp::ok_with_empty()
 }
@@ -113,8 +109,7 @@ pub async fn batch(ctx: HttpContext) -> HttpResult {
     let param: Req = ctx.into_json().await?;
     check_result!(SysDict::batch_update_by_type(param.dict_type, &param.dict_names).await);
 
-    rmq::publish_rec_change_spawm::<Option<()>>(rmq::ChannelName::ModDict,
-        rmq::RecordChangedType::All, None,);
+    emit(ChannelName::ModDict, &RecChanged::<()>::with_all());
 
     Resp::ok_with_empty()
 }

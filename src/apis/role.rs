@@ -1,6 +1,10 @@
 //! 角色表接口
 
-use crate::{entities::{PageQuery, sys_role::SysRole, PageData}, services::rmq};
+use crate::{
+    entities::{PageQuery, sys_role::SysRole, PageData},
+    services::rmq::{ChannelName},
+    utils::pub_rec::{type_from_id, emit, RecChanged}
+};
 use httpserver::{HttpContext, Resp, HttpResult, check_required, check_result};
 use localtime::LocalTime;
 
@@ -30,7 +34,6 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
 /// 更新单条记录
 pub async fn post(ctx: HttpContext) -> HttpResult {
     type Req = SysRole;
-    type Res = SysRole;
 
     let mut param: Req = ctx.into_json().await?;
     check_required!(param, role_name);
@@ -49,19 +52,11 @@ pub async fn post(ctx: HttpContext) -> HttpResult {
         None => SysRole::insert(&param).await.map(|(_, id)| id),
     });
 
-    let typ = match param.role_id {
-        Some(_) => rmq::RecordChangedType::Update,
-        None => rmq::RecordChangedType::Insert,
-    };
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModRole, typ, SysRole {
-        role_id: Some(id),
-        ..Default::default()
-    });
+    let res = SysRole { role_id: Some(id), ..Default::default() };
+    let type_ = type_from_id(&param.role_id);
+    emit(ChannelName::ModRole, &RecChanged::new(type_, &res));
 
-    Resp::ok( &Res {
-        role_id: Some(id),
-        ..Default::default()
-    })
+    Resp::ok(&res)
 }
 
 /// 删除记录
@@ -71,13 +66,10 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
     let param: Req = ctx.into_json().await?;
     check_result!(SysRole::delete_by_id(&param.id).await);
 
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModRole,
-        rmq::RecordChangedType::Delete,
-        SysRole {
-            role_id: Some(param.id),
-            ..Default::default()
-        }
-    );
+    emit(ChannelName::ModRole, &RecChanged::with_delete(&SysRole {
+        role_id: Some(param.id),
+        ..Default::default()
+    }));
 
     Resp::ok_with_empty()
 }

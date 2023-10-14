@@ -4,11 +4,12 @@ use std::collections::HashMap;
 
 use crate::{
     entities::{
-        PageQuery,
+        PageQuery, PageData,
         sys_permission::{SysPermission, SysPermissionRearrange},
-        sys_dict::{SysDict, DictType}, PageData
+        sys_dict::{SysDict, DictType}
     },
-    services::rmq
+    services::rmq::{ChannelName},
+    utils::pub_rec::{type_from_id, emit, RecChanged}
 };
 
 use httpserver::{HttpContext, Resp, HttpResult, check_required, check_result};
@@ -49,7 +50,6 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
 /// 更新单条记录
 pub async fn post(ctx: HttpContext) -> HttpResult {
     type Req = SysPermission;
-    type Res = SysPermission;
 
     let mut param: Req = ctx.into_json().await?;
     check_required!(param, group_code, permission_code, permission_name);
@@ -67,19 +67,11 @@ pub async fn post(ctx: HttpContext) -> HttpResult {
         None => SysPermission::insert(&param).await.map(|(_, id)| id),
     });
 
-    let typ = match param.permission_id {
-        Some(_) => rmq::RecordChangedType::Update,
-        None => rmq::RecordChangedType::Insert,
-    };
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModConfig, typ, SysPermission {
-        permission_id: Some(id),
-        ..Default::default()
-    });
+    let res = SysPermission { permission_id: Some(id), ..Default::default() };
+    let type_ = type_from_id(&param.permission_id);
+    emit(ChannelName::ModConfig, &RecChanged::new(type_, &res));
 
-    Resp::ok( &Res {
-        permission_id: Some(id),
-        ..Default::default()
-    })
+    Resp::ok(&res)
 }
 
 /// 删除记录
@@ -90,13 +82,10 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
     let r = SysPermission::delete_by_id(&param.id).await;
     check_result!(r);
 
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModPermission,
-        rmq::RecordChangedType::Delete,
-        SysPermission {
-            permission_id: Some(param.id),
-            ..Default::default()
-        }
-    );
+    emit(ChannelName::ModPermission, &RecChanged::with_delete(&SysPermission {
+        permission_id: Some(param.id),
+        ..Default::default()
+    }));
 
     Resp::ok_with_empty()
 }
@@ -129,14 +118,10 @@ pub async fn rearrange(ctx: HttpContext) -> HttpResult {
     let param: Req = ctx.into_json().await?;
     check_result!(SysPermission::rearrange(&param).await);
 
-    rmq::publish_rec_change_spawm::<Option<()>>(rmq::ChannelName::ModPermission,
-        rmq::RecordChangedType::All, None);
-    rmq::publish_rec_change_spawm::<Option<()>>(rmq::ChannelName::ModApi,
-        rmq::RecordChangedType::All, None);
-    rmq::publish_rec_change_spawm::<Option<()>>(rmq::ChannelName::ModRole,
-        rmq::RecordChangedType::All, None);
-    rmq::publish_rec_change_spawm::<Option<()>>(rmq::ChannelName::ModMenu,
-        rmq::RecordChangedType::All, None);
+    emit(ChannelName::ModPermission, &RecChanged::<()>::with_all());
+    emit(ChannelName::ModApi, &RecChanged::<()>::with_all());
+    emit(ChannelName::ModRole, &RecChanged::<()>::with_all());
+    emit(ChannelName::ModMenu, &RecChanged::<()>::with_all());
 
     Resp::ok_with_empty()
 }

@@ -1,6 +1,11 @@
 //! 系统配置接口
 
-use crate::{entities::{sys_config::SysConfig, PageQuery}, services::rmq};
+use crate::{
+    entities::{sys_config::SysConfig, PageQuery},
+    services::rmq::ChannelName,
+    utils::pub_rec::{RecChanged, type_from_id, emit}
+};
+
 use httpserver::{HttpContext, Resp, HttpResult, check_required, check_result};
 use localtime::LocalTime;
 
@@ -30,7 +35,6 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
 /// 更新单条记录
 pub async fn post(ctx: HttpContext) -> HttpResult {
     type Req = SysConfig;
-    type Res = SysConfig;
 
     let mut param: Req = ctx.into_json().await?;
 
@@ -43,19 +47,11 @@ pub async fn post(ctx: HttpContext) -> HttpResult {
         None => SysConfig::insert(&param).await.map(|(_, id)| id),
     });
 
-    let typ = match param.cfg_id {
-        Some(_) => rmq::RecordChangedType::Update,
-        None => rmq::RecordChangedType::Insert,
-    };
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModConfig, typ, SysConfig {
-        cfg_id: Some(id),
-        ..Default::default()
-    });
+    let res = SysConfig { cfg_id: Some(id), ..Default::default() };
+    let type_ = type_from_id(&param.cfg_id);
+    emit(ChannelName::ModConfig, &RecChanged::new(type_, &res));
 
-    Resp::ok( &Res {
-        cfg_id: Some(id),
-        ..Default::default()
-    })
+    Resp::ok(&res)
 }
 
 /// 删除记录
@@ -66,13 +62,10 @@ pub async fn del(ctx: HttpContext) -> HttpResult {
     let r = SysConfig::delete_by_id(&param.id).await;
     check_result!(r);
 
-    rmq::publish_rec_change_spawm(rmq::ChannelName::ModConfig,
-        rmq::RecordChangedType::Delete,
-        SysConfig {
-            cfg_id: Some(param.id),
-            ..Default::default()
-        }
-    );
+    emit(ChannelName::ModConfig, &RecChanged::with_delete(&SysConfig {
+        cfg_id: Some(param.id),
+        ..Default::default()
+    }));
 
     Resp::ok_with_empty()
 }
