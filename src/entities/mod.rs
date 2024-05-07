@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 pub mod sys_api;
 pub mod sys_config;
 pub mod sys_dict;
@@ -6,8 +8,6 @@ pub mod sys_permission;
 pub mod sys_role;
 pub mod sys_user;
 pub mod sys_user_state;
-
-use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 pub struct PageData<T> {
@@ -39,26 +39,32 @@ impl PageInfo {
 
     #[allow(dead_code)]
     pub fn with(index: u32, size: u32) -> Self {
-        Self { index, size, total: None }
+        Self {
+            index,
+            size,
+            total: None,
+        }
     }
 
     #[allow(dead_code)]
     pub fn with_total(index: u32, size: u32, total: Option<u32>) -> Self {
-        Self { index, size , total }
+        Self { index, size, total }
     }
 }
 
-impl <T> PageQuery<T> {
-    pub fn data(&self) -> &T {
-        &self.inner
-    }
-
-    pub fn to_page_info(&self) -> PageInfo {
+impl<T> PageQuery<T> {
+    pub fn page_info(&self) -> PageInfo {
         PageInfo {
             index: self.i,
             size: self.p,
             total: match self.a {
-                Some(total) => if total < 0 { None } else { Some(total as u32) },
+                Some(total) => {
+                    if total < 0 {
+                        None
+                    } else {
+                        Some(total as u32)
+                    }
+                }
                 None => None,
             },
         }

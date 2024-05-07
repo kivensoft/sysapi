@@ -1,7 +1,6 @@
 //! MD5 Crypt(3) 自定义MD5加密算法实现
-
-use anyhow::Result;
-use md5::{Md5, Digest};
+use anyhow_ext::{bail, Context, Result};
+use md5::{Digest, Md5};
 use rand::Rng;
 
 const SALT_LEN: usize = 8;
@@ -38,13 +37,13 @@ pub fn encrypt(password: &str) -> Result<String> {
     let mut pass_out = [0; PWD_LEN];
     do_encrypt(&mut pass_out, password.as_bytes(), &salt_base64);
 
-    Ok(String::from(std::str::from_utf8(&pass_out)?))
+    Ok(String::from(std::str::from_utf8(&pass_out).dot()?))
 }
 
 /// 口令校验
 pub fn verify(pw_plain: &str, pw_encrypt: &str) -> Result<bool> {
     if pw_encrypt.len() < PWD_LEN || !pw_encrypt.starts_with(SALT_MAGIC) {
-        anyhow::bail!("密码格式错误")
+        bail!("密码格式错误");
     }
 
     let digest = pw_encrypt.as_bytes();
@@ -55,8 +54,12 @@ pub fn verify(pw_plain: &str, pw_encrypt: &str) -> Result<bool> {
 
     let verify_result = pass_out == digest;
     if !verify_result {
-        log::trace!("密码校验错误: 原密码 = [{}], 计算结果 = [{}], 期望结果 = [{}]",
-                pw_plain, std::str::from_utf8(&pass_out).unwrap(), pw_encrypt);
+        log::trace!(
+            "密码校验错误: 原密码 = [{}], 计算结果 = [{}], 期望结果 = [{}]",
+            pw_plain,
+            std::str::from_utf8(&pass_out).context("md5校验失败: 非法utf8字符").dot()?,
+            pw_encrypt
+        );
     }
 
     Ok(verify_result)
@@ -128,17 +131,18 @@ fn do_encrypt(out: &mut [u8], password: &[u8], salt: &[u8]) {
 
     // 将 password 加密后的结果进行base64编码，并写入返回参数
     let fs = &mut out[DIGEST_OFFSET..];
-    to_base64(fs, &final_state, &CRYPT_B64_CHARS);
+    to_base64(fs, &final_state, CRYPT_B64_CHARS);
 }
 
 fn to_base64(out: &mut [u8], input: &[u8], alphabet: &[u8]) -> usize {
     let (align_step, noalign_count) = (input.len() / 3, input.len() % 3);
-    let write_count = align_step * 4 + match noalign_count {
-        0 => 0,
-        1 => 2,
-        2 => 3,
-        _ => unsafe { std::hint::unreachable_unchecked() }
-    };
+    let write_count = align_step * 4
+        + match noalign_count {
+            0 => 0,
+            1 => 2,
+            2 => 3,
+            _ => unsafe { std::hint::unreachable_unchecked() },
+        };
 
     assert!(out.len() >= write_count && alphabet.len() == 64);
 
@@ -179,7 +183,7 @@ fn to_base64(out: &mut [u8], input: &[u8], alphabet: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{rand_password, encrypt, verify};
+    use super::{encrypt, rand_password, verify};
 
     #[test]
     fn test_rand_password() {

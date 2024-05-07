@@ -1,7 +1,12 @@
 //! redis 缓存服务
 use crate::AppConf;
-use anyhow::Result;
-use deadpool_redis::{redis::{self, FromRedisValue, Cmd}, Config, Connection, Pool, Runtime};
+use anyhow_ext::{Context, Result};
+use deadpool_redis::{
+    redis::{self, Cmd, FromRedisValue, ToRedisArgs},
+    Config, Connection, Pool, Runtime,
+};
+use lz4_flex::{compress_prepend_size, decompress_size_prepended};
+use serde::{de::DeserializeOwned, Serialize};
 
 #[allow(dead_code)]
 pub const TTL_NOT_EXISTS: i32 = -2;
@@ -22,20 +27,13 @@ pub async fn get_conn() -> Result<Connection> {
     unsafe {
         debug_assert!(CACHE_POOL.is_some());
         match &CACHE_POOL {
-            Some(pool) => {
-                match pool.get().await {
-                    Ok(v) => Ok(v),
-                    Err(e) => {
-                        log::error!("redis get connection error: {e:?}");
-                        Err(anyhow::anyhow!("系统内部错误, 连接缓存服务失败"))
-                    }
-                }
-            },
+            Some(pool) => pool.get().await.context("redis获取连接异常"),
             _ => std::hint::unreachable_unchecked(),
         }
     }
 }
 
+/// 初始化redis连接池
 pub fn init_pool(ac: &AppConf) -> Result<()> {
     debug_assert!(unsafe { CACHE_POOL.is_none() });
 
@@ -54,53 +52,165 @@ pub fn init_pool(ac: &AppConf) -> Result<()> {
 }
 
 /// 获取key对应的value, 返回原始的字符串值(不做转换)
-pub async fn get(key: &str) -> Result<Option<String>> {
-    query_async(&Cmd::get(key)).await
+pub async fn get<T: FromRedisValue>(key: &str) -> Option<T> {
+    match query_async(&Cmd::get(key)).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("查询redis缓存异常: {e:?}");
+            None
+        }
+    }
 }
 
 /// 设置key, value, secs指定存活时间
-pub async fn set(key: &str, value: &str, ttl: usize) -> Result<()> {
-    query_async(&Cmd::set_ex(key, value, ttl)).await
+pub async fn set<T: ToRedisArgs>(key: &str, value: T, ttl: u64) {
+    if let Err(e) = query_async::<()>(&Cmd::set_ex(key, value, ttl)).await {
+        log::error!("保存redis缓存异常: {e:?}");
+    }
+}
+
+/// 获取key对应的value并进行解压缩, 返回原始的字符串值(不做转换)
+#[allow(dead_code)]
+pub async fn lz4_get(key: &str) -> Option<Vec<u8>> {
+    if let Some(v) = get::<Vec<u8>>(key).await {
+        match decompress_size_prepended(&v) {
+            Ok(v) => return Some(v),
+            Err(e) => log::error!("lz4解压缩异常: {e:?}"),
+        }
+    }
+    None
+}
+
+/// 压缩value并进行key, value保存, secs指定存活时间
+#[allow(dead_code)]
+pub async fn lz4_set(key: &str, value: &[u8], ttl: u64) {
+    set(key, compress_prepend_size(value), ttl).await
+}
+
+/// 获取key对应的value并进行json解码
+#[allow(dead_code)]
+pub async fn json_get<T: DeserializeOwned>(key: &str) -> Option<T> {
+    if let Some(v) = get::<Vec<u8>>(key).await {
+        match serde_json::from_slice(&v) {
+            Ok(v) => return Some(v),
+            Err(e) => log::error!("json解码异常: {e:?}"),
+        }
+    }
+    None
+}
+
+/// 设置key, value, secs指定存活时间
+#[allow(dead_code)]
+pub async fn json_set<T: Serialize>(key: &str, value: &T, ttl: u64) {
+    match serde_json::to_vec(&value) {
+        Ok(v) => set(key, v, ttl).await,
+        Err(e) => log::error!("json编码异常: {e:?}"),
+    }
+}
+
+/// 获取key对应的value并进行解压缩, 返回原始的字符串值(不做转换)
+#[allow(dead_code)]
+pub async fn json_lz4_get<T: DeserializeOwned>(key: &str) -> Option<T> {
+    if let Some(v) = get::<Vec<u8>>(key).await {
+        match decompress_size_prepended(&v) {
+            Ok(v) => match serde_json::from_slice(&v) {
+                Ok(v) => return Some(v),
+                Err(e) => log::error!("json解码失败: {e:?}"),
+            },
+            Err(e) => log::error!("lz4解压缩异常: {e:?}"),
+        }
+    }
+    None
+}
+
+/// 压缩value并进行key, value保存, secs指定存活时间
+#[allow(dead_code)]
+pub async fn json_lz4_set<T: Serialize>(key: &str, value: &T, ttl: u64) {
+    match serde_json::to_vec(&value) {
+        Ok(v) => set(key, compress_prepend_size(&v), ttl).await,
+        Err(e) => log::error!("json编码异常: {e:?}"),
+    }
 }
 
 /// 删除key，返回删除数量
 #[allow(dead_code)]
-pub async fn del(keys: &[String]) -> Result<u64> {
-    query_async(&Cmd::del(keys)).await
+pub async fn del<T: ToRedisArgs>(keys: T) -> Option<u64> {
+    match query_async(&Cmd::del(keys)).await {
+        Ok(n) => n,
+        Err(e) => {
+            log::error!("redis删除缓存项异常: {e:?}");
+            None
+        }
+    }
 }
 
 /// 自增，返回自增后的值
-pub async fn incr(key: &str, secs: usize) -> Result<u64> {
-    let mut conn = get_conn().await?;
-    let ret: u64 = query_async2(&mut conn, &Cmd::incr(key, 1)).await?;
-    if secs > 0 {
-        query_async2(&mut conn, &Cmd::expire(key, secs)).await?;
+///
+/// Arguments
+/// * `key`: 键
+/// * `secs`: 缓存超时时间, 为0时，不设置超时时间
+///
+pub async fn incr(key: &str, secs: i64) -> u64 {
+    match get_conn().await {
+        Ok(mut conn) => match query_async_with(&mut conn, &Cmd::incr(key, 1)).await {
+            Ok(n) => {
+                if secs > 0 {
+                    match query_async_with::<()>(&mut conn, &Cmd::expire(key, secs)).await {
+                        Ok(_) => return n,
+                        Err(e) => log::error!("redis设置缓存项超时时间异常: {e:?}"),
+                    }
+                } else {
+                    return n;
+                }
+            }
+            Err(e) => log::error!("redis获取自增缓存项异常: {e:?}"),
+        },
+        Err(e) => log::error!("redis获取缓存连接异常: {e:?}"),
     }
-    Ok(ret)
+
+    0
 }
 
 /// 获取key的当前存活时间，秒为单位
-pub async fn ttl(key: &str) -> Result<i32> {
-    query_async(&Cmd::ttl(key)).await
+pub async fn ttl(key: &str) -> i32 {
+    match query_async(&Cmd::ttl(key)).await {
+        Ok(n) => n,
+        Err(e) => {
+            log::error!("redis设置缓存项存活时间异常: {e:?}");
+            -2
+        }
+    }
 }
 
 /// 设置key的存活时间，秒为单位
 #[allow(dead_code)]
-pub async fn expire(key: &str, secs: usize) -> Result<bool> {
-    let ret: u32 = query_async(&Cmd::expire(key, secs)).await?;
-    Ok(ret == 1)
+pub async fn expire(key: &str, secs: i64) -> bool {
+    match query_async::<u32>(&Cmd::expire(key, secs)).await {
+        Ok(n) => n == 1,
+        Err(e) => {
+            log::error!("redis设置缓存存活时间异常: {e:?}");
+            false
+        }
+    }
 }
 
 /// 查询键
-pub async fn keys(key: &str) -> Result<Vec<String>> {
-    query_async(&Cmd::keys(key)).await
+pub async fn keys(key: &str) -> Option<Vec<String>> {
+    match query_async(&Cmd::keys(key)).await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            log::error!("redis查询键异常: {e:?}");
+            None
+        }
+    }
 }
 
 /// 发布消息
 #[allow(dead_code)]
-pub async fn publish(channel: &str, message: &str) -> Result<()> {
-    query_async(&Cmd::publish(channel, message)).await?;
-    Ok(())
+pub async fn publish(channel: &str, message: &str) {
+    if let Err(e) = query_async::<()>(&Cmd::publish(channel, message)).await {
+        log::error!("redis发布消息异常: {e:?}");
+    }
 }
 
 fn gen_url(ac: &AppConf) -> String {
@@ -116,7 +226,7 @@ fn try_connect(url: &str) -> Result<()> {
     let mut conn = c.get_connection()?;
     let val: String = redis::cmd("PING").arg(crate::APP_NAME).query(&mut conn)?;
     if val != crate::APP_NAME {
-        anyhow::bail!(format!("can't connect redis server: {url}"));
+        anyhow_ext::bail!(format!("can't connect redis server: {url}"));
     }
 
     Ok(())
@@ -124,15 +234,9 @@ fn try_connect(url: &str) -> Result<()> {
 
 async fn query_async<T: FromRedisValue>(cmd: &Cmd) -> Result<T> {
     let mut conn = get_conn().await?;
-    query_async2(&mut conn, cmd).await
+    query_async_with(&mut conn, cmd).await
 }
 
-async fn query_async2<T: FromRedisValue>(conn: &mut Connection, cmd: &Cmd) -> Result<T> {
-    match cmd.query_async(conn).await {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            log::error!("redis query async error: {e:?}");
-            anyhow::bail!("系统内部错误, 缓存操作失败")
-        }
-    }
+async fn query_async_with<T: FromRedisValue>(conn: &mut Connection, cmd: &Cmd) -> Result<T> {
+    cmd.query_async(conn).await.context("执行redis命令失败")
 }

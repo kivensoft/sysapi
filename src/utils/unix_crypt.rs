@@ -1,9 +1,9 @@
 //! Unix Crypt(3) 加密算法实现
 use std::cmp::min;
-
-use anyhow::Result;
 use md5::{Md5, Digest};
 use rand::Rng;
+
+type Result<T> = Result<T, Error>;
 
 const SALT_LEN: usize = 8;
 const DIGEST_LEN: usize = 22;
@@ -28,7 +28,7 @@ pub fn encrypt(password: &str) -> Result<String> {
 /// 口令校验
 pub fn verify(pw_plain: &str, pw_encrypt: &str) -> Result<bool> {
     if pw_encrypt.len() < PWD_LEN || !pw_encrypt.starts_with(SALT_MAGIC) {
-        anyhow::bail!("密码格式错误")
+        return Err("密码格式错误".into())
     }
 
     let digest = pw_encrypt.as_bytes();

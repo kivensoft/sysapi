@@ -1,252 +1,294 @@
-use anyhow::Result;
+//! 菜单表
+use super::{PageData, PageInfo};
+use crate::{
+    entities::{
+        sys_dict::{DictType, SysDict},
+        sys_permission::SysPermission,
+    },
+    services::{rcache, rmq},
+    AppConf,
+};
 use compact_str::format_compact;
-use gensql::{table_define, get_conn, query_one_sql, query_all_sql, row_map, vec_value, Queryable, Row, FromValue, table_flatten};
+use gensql::{table, DbResult, Queryable};
 use localtime::LocalTime;
 use tokio::sync::OnceCell;
 
-use crate::{
-    AppConf, services::{rcache, rmq},
-    entities::{sys_permission::SysPermission, sys_dict::{SysDict, DictType}}
-};
-
-use super::{PageData, PageInfo};
-
 static SUBSCRIBE_INIT: OnceCell<bool> = OnceCell::const_new();
 
-table_define!{"t_sys_menu", SysMenu,
-    menu_id:            u32,
-    client_type:        u16,
-    menu_code:          String,
-    permission_code:    i16,
-    menu_name:          String,
-    menu_link:          String,
-    menu_icon:          String,
-    menu_desc:          String,
-    updated_time:       LocalTime,
+/// 系统接口表
+#[table("t_sys_menu")]
+pub struct SysMenu {
+    /// 菜单id
+    #[table(id)]
+    menu_id: u32,
+    /// 客户端类型
+    client_type: u16,
+    /// 菜单代码
+    menu_code: String,
+    /// 权限代码
+    permission_code: i16,
+    /// 菜单名称
+    menu_name: String,
+    /// 菜单链接
+    menu_link: String,
+    /// 菜单图标
+    menu_icon: String,
+    /// 菜单描述
+    menu_desc: String,
+    /// 更新时间
+    updated_time: LocalTime,
 }
 
-table_flatten!{SysMenuVo, SysMenu,
+#[table]
+pub struct SysMenuExt {
+    #[serde(flatten)]
+    inner: SysMenu,
+    /// 客户端类型名称
     client_type_name: String,
-    permission_name:  String,
-
-    group_code:       i16,
-    group_name:       String,
-
+    /// 权限名称
+    permission_name: String,
+    /// 权限组代码
+    group_code: i16,
+    /// 权限组名称
+    group_name: String,
+    /// 父菜单代码
     parent_menu_code: String,
+    /// 父菜单名称
     parent_menu_name: String,
-
-    menus:            Vec<SysMenuVo>,
 }
 
+#[table]
+pub struct SysMenuVo {
+    #[serde(flatten)]
+    pub inner: SysMenuExt, // 子菜单列表
+    #[table(ignore)]
+    pub menus: Vec<SysMenuVo>, // 子菜单列表
+}
 
 impl SysMenu {
-    /// 查询记录
-    pub async fn select_page(value: &SysMenu, page: PageInfo) -> Result<PageData<SysMenuVo>> {
+    /// 系统菜单分页查询
+    ///
+    /// Arguments:
+    ///
+    /// * `value`: 查询参数
+    /// * `page`: 查询分页参数
+    ///
+    /// Returns:
+    ///
+    /// 分页结果列表
+    pub async fn select_page(value: SysMenu, page: PageInfo) -> DbResult<PageData<SysMenuVo>> {
         type T = SysMenu;
         type C = SysDict;
         type P = SysPermission;
         type G = SysDict;
-        type T1 = SysMenu;
 
-        const T: &str = "t";
-        const C: &str = "c";
-        const P: &str = "p";
-        const G: &str = "g";
-        const T1: &str = "t1";
+        let (t, c, p, g, t1) = ("t", "c", "p", "g", "t1");
 
         let (tsql, psql, params) = gensql::SelectSql::new()
-            .select_slice(T, Self::FIELDS)
-                .select_as(C, C::DICT_NAME, SysMenuVo::CLIENT_TYPE_NAME)
-                .select_ext(P, P::PERMISSION_NAME)
-                .select_as(G, G::DICT_CODE, SysMenuVo::GROUP_CODE)
-                .select_as(G, G::DICT_NAME, SysMenuVo::GROUP_NAME)
-                .select_as(T1, T1::MENU_NAME, SysMenuVo::PARENT_MENU_NAME)
-            .from_alias(Self::TABLE, T)
-            .left_join(P::TABLE, P)
-                .on_eq(P, P::PERMISSION_CODE, T, T::PERMISSION_CODE)
-                .end_join()
-            .left_join(T1::TABLE, T1)
-                .on(&format_compact!("{}.{} = left({}.{}, length({}.{}) - 2)",
-                    T1, T1::MENU_CODE, T, T::MENU_CODE, T, T::MENU_CODE))
-                .end_join()
-            .left_join(C::TABLE, C)
-                .on_eq(C, C::DICT_CODE, T, T::CLIENT_TYPE)
-                .on_eq_val(C, C::DICT_TYPE, &(DictType::ClientType as u16))
-                .end_join()
-            .left_join(G::TABLE, G)
-                .on_eq(G, G::DICT_CODE, P, P::GROUP_CODE)
-                .on_eq_val(G, G::DICT_TYPE, &(DictType::PermissionGroup as u16))
-                .end_join()
-            .where_sql()
-                .eq_opt(T, Self::CLIENT_TYPE, &value.client_type)
-                .eq_opt(T, Self::PERMISSION_CODE, &value.permission_code)
-                .like_opt(T, Self::MENU_NAME, &value.menu_name)
-                .like_opt(T, Self::MENU_LINK, &value.menu_link)
-                .like_right_opt(T, Self::MENU_CODE, &value.menu_code)
-                .end_where()
-            .order_by(T, Self::MENU_CODE)
-            .build_with_page(page.index, page.size, page.total)?;
+            .select_columns_with_table(t, &Self::FIELDS)
+            .select_as(c, C::DICT_NAME, SysMenuExt::CLIENT_TYPE_NAME)
+            .select_with_table(p, P::PERMISSION_NAME)
+            .select_as(g, G::DICT_CODE, SysMenuExt::GROUP_CODE)
+            .select_as(g, G::DICT_NAME, SysMenuExt::GROUP_NAME)
+            .select_as(t1, T::MENU_NAME, SysMenuExt::PARENT_MENU_NAME)
+            .from_alias(Self::TABLE_NAME, t)
+            .left_join(P::TABLE_NAME, p, |j|
+                j.on_eq(P::PERMISSION_CODE, t, T::PERMISSION_CODE)
+            )
+            .left_join(T::TABLE_NAME, t1, |j|
+                j.on(&format_compact!(
+                    "{}.{} = left({}.{1}, length({2}.{1}) - 2)",
+                    t1,
+                    T::MENU_CODE,
+                    t
+                ))
+            )
+            .left_join(C::TABLE_NAME, c, |j|
+                j.on_eq(C::DICT_CODE, t, T::CLIENT_TYPE)
+                    .on_eq_val(C::DICT_TYPE, DictType::ClientType as u16)
+            )
+            .left_join(G::TABLE_NAME, g, |j|
+                j.on_eq(G::DICT_CODE, p, P::GROUP_CODE)
+                    .on_eq_val(G::DICT_TYPE, DictType::PermissionGroup as u16)
+            )
+            .where_sql(|w|
+                w.eq_opt(t, T::CLIENT_TYPE, value.client_type)
+                    .eq_opt(t, T::PERMISSION_CODE, value.permission_code)
+                    .like_opt(t, T::MENU_NAME, value.menu_name)
+                    .like_opt(t, T::MENU_LINK, value.menu_link)
+                    .like_right_opt(t, T::MENU_CODE, value.menu_code)
+            )
+            .order_by_with_table(t, T::MENU_CODE)
+            .build_with_page(page.index, page.size, page.total);
 
-        let mut conn = get_conn().await?;
+        let mut conn = gensql::get_conn().await?;
 
-        let total = if tsql.is_empty() {
-            page.total.unwrap_or(0)
-        } else {
-            conn.query_one_sql(&tsql, &params).await?.map(|(total,)| total).unwrap_or(0)
+        let total = match page.total {
+            Some(n) => n,
+            None => conn.query_one(tsql, params.clone()).await?.unwrap_or(0)
         };
 
-        let list = conn.query_all_sql(psql, params, |row: Row| {
-            let mut row_iter = row.unwrap().into_iter();
+        let list = conn.query_fast(psql, params).await?;
 
-            macro_rules! fv {
-                () => { FromValue::from_value(row_iter.next().unwrap()) };
-            }
-
-            let mut res = SysMenuVo {
-                inner: SysMenu {
-                    menu_id:         fv!(),
-                    client_type:     fv!(),
-                    menu_code:       fv!(),
-                    permission_code: fv!(),
-                    menu_name:       fv!(),
-                    menu_link:       fv!(),
-                    menu_icon:       fv!(),
-                    menu_desc:       fv!(),
-                    updated_time:    fv!(),
-                },
-                client_type_name: fv!(),
-                permission_name:  fv!(),
-                group_code:       fv!(),
-                group_name:       fv!(),
-                parent_menu_code: None,
-                parent_menu_name: fv!(),
-                menus:            None,
-            };
-
-            if let Some(mc) = &res.inner.menu_code {
-                if mc.len() >= 2 {
-                    let pmc = &mc[0..mc.len() - 2];
-                    res.parent_menu_code = Some(pmc.to_owned());
-                }
-            }
-
-            res
-        }).await?;
-
-        Ok(PageData { total, list, })
+        Ok(PageData { total, list })
     }
 
-    /// 加载所有记录
-    pub async fn select_by_client_type(client_type: u16) -> Result<Vec<SysMenu>> {
-        // 首次运行时启动菜单变化的消息订阅处理函数
-        SUBSCRIBE_INIT.get_or_init(|| async {
-            let channel = rmq::make_channel(rmq::ChannelName::ModMenu);
-            let chan_id = rmq::subscribe(channel, |_| async {
-                let cache_key_pre = format_compact!("{}:{}:*",
-                        AppConf::get().cache_pre, rcache::CK_MENUS);
-                let keys = rcache::keys(&cache_key_pre).await?;
-                log::trace!("收到菜单变化消息, 删除缓存项: {keys:?}");
-                rcache::del(&keys).await?;
-                Ok(())
-            }).await.expect("订阅菜单变化频道失败");
+    /// 根据客户端类型异步查询系统菜单列表，优先从缓存中获取数据，并在首次运行时启动菜单变化的消息订阅处理函数。
+    ///
+    /// Arguments:
+    ///
+    /// * `client_type`: 客户端类型
+    /// 16 位整数 (‘u16’)，表示正在检索其菜单项的客户端类型。该函数获取菜单项
+    ///
+    /// Returns:
+    ///
+    /// 查询成功则返回指定客户端类型的系统菜单列表，若失败则返回错误信息。
+    pub async fn select_by_client_type(client_type: u16) -> DbResult<Vec<SysMenu>> {
+        // 首次调用时初始化菜单消息订阅处理函数
+        SUBSCRIBE_INIT.get_or_init(subscribe_init).await;
 
-            if chan_id == 0 {
-                log::error!("订阅菜单变化频道失败: 该频道已经被订阅");
-            }
-
-            true
-        }).await;
-
-        // 优先从缓存中读取
-        let cache_key = format_compact!("{}:{}:{}",
-                AppConf::get().cache_pre, rcache::CK_MENUS, client_type);
-        if let Some(cache_val) = rcache::get(&cache_key).await? {
-            rcache::expire(&cache_key, rcache::DEFAULT_TTL as usize).await?;
-            return Ok(serde_json::from_str(&cache_val)?);
+        // 尝试从缓存中读取菜单项
+        let cache_key = format_compact!(
+            "{}:{}:{}",
+            AppConf::get().cache_pre,
+            rcache::CK_MENUS,
+            client_type
+        );
+        if let Some(cache_val) = rcache::json_lz4_get(&cache_key).await {
+            // 设置缓存过期时间并直接返回缓存中的菜单项
+            rcache::expire(&cache_key, rcache::DEFAULT_TTL as i64).await;
+            log::trace!("加载菜单项时使用缓存: client_type = {}", client_type);
+            return Ok(cache_val);
         }
 
-        type T = SysMenu;
+        // 定义查询字段
         const FIELDS: [&str; 6] = [
-            T::MENU_ID, T::MENU_CODE, T::PERMISSION_CODE,
-            T::MENU_NAME, T::MENU_LINK, T::MENU_ICON,
+            SysMenu::MENU_ID,
+            SysMenu::MENU_CODE,
+            SysMenu::PERMISSION_CODE,
+            SysMenu::MENU_NAME,
+            SysMenu::MENU_LINK,
+            SysMenu::MENU_ICON,
         ];
 
+        // 使用gensql构建SQL查询语句和参数
         let (sql, params) = gensql::SelectSql::new()
-            .select_slice("", &FIELDS)
-            .from(Self::TABLE)
-            .where_sql()
-            .eq("", Self::CLIENT_TYPE, &client_type)
-            .end_where()
-            .order_by("", Self::MENU_CODE)
+            .select_columns_with_table("", &FIELDS)
+            .from(SysMenu::TABLE_NAME)
+            .where_sql(|w|
+                w.eq("", SysMenu::CLIENT_TYPE, client_type)
+            )
+            .order_by_with_table("", SysMenu::MENU_CODE)
             .build();
 
-        let menus = query_all_sql(&sql, &params, row_map!(SysMenu,
-                menu_id,
-                menu_code,
-                permission_code,
-                menu_name,
-                menu_link,
-                menu_icon,
-            )).await?;
+        // 执行SQL查询并转换结果到SysMenu对象列表
+        let menus = gensql::sql_query_fast(sql, params).await?;
 
-        // 查询结果写入缓存
-        let cache_val = serde_json::to_string(&menus)?;
-        rcache::set(&cache_key, &cache_val, rcache::DEFAULT_TTL as usize).await?;
+        // 将查询结果写入缓存
+        rcache::json_lz4_set(&cache_key, &menus, rcache::DEFAULT_TTL as u64).await;
 
+        // 返回查询结果
         Ok(menus)
     }
 
-    pub async fn select_all() -> Result<Vec<SysMenu>> {
+    /// 获取所有系统菜单
+    ///
+    pub async fn select_all() -> DbResult<Vec<SysMenu>> {
+        // 构建SQL语句
         let (sql, params) = gensql::SelectSql::new()
-            .select_slice("", Self::FIELDS)
-            .from(Self::TABLE)
-            .order_by("", Self::MENU_CODE)
+            .select_columns(&Self::FIELDS)
+            .from(Self::TABLE_NAME)
+            .order_by(Self::MENU_CODE)
             .build();
-        query_all_sql(sql, params, Self::row_map).await
+        // 执行SQL查询并返回结果
+        gensql::sql_query_fast(sql, params).await
     }
 
-    pub async fn select_top_level() -> Result<Vec<SysMenu>> {
+    /// 获取顶级菜单列表
+    pub async fn select_top_level() -> DbResult<Vec<SysMenu>> {
+        // 构建SQL语句
         let (sql, params) = gensql::SelectSql::new()
-            .select_slice("", Self::FIELDS)
-            .from(Self::TABLE)
-            .where_sql()
-            .add_sql(&format_compact!("and {} like '__'", Self::MENU_CODE))
-            .end_where()
+            .select_columns(&Self::FIELDS)
+            .from(Self::TABLE_NAME)
+            .where_sql(|w|
+                w.add_sql(&format_compact!("and {} like '__'", Self::MENU_CODE))
+            )
             .build();
 
-        query_all_sql(&sql, &params, Self::row_map).await
+        // 执行SQL查询
+        gensql::sql_query_fast(sql, params).await
     }
 
-    pub async fn select_max_code(parent_menu_code: &str) -> Result<Option<String>> {
+    /// 查询指定父菜单代码的子菜单最大代码值
+    ///
+    /// Arguments:
+    ///
+    /// * `parent_menu_code`: 父菜单代码
+    ///
+    /// Returns:
+    ///
+    /// `Option<String>` 子菜单最大代码值
+    ///
+    /// `None` 不存在子菜单
+    pub async fn select_max_code(parent_menu_code: &str) -> DbResult<Option<String>> {
         let pmc = format!("{}__", parent_menu_code);
         let (sql, params) = gensql::SelectSql::new()
             .select(&format_compact!("max({})", Self::MENU_CODE))
-            .from(Self::TABLE)
-            .where_sql()
-            .add_value(&format_compact!("{} like ?", Self::MENU_CODE), &pmc)
-            .end_where()
+            .from(Self::TABLE_NAME)
+            .where_sql(|w|
+                w.add_value(&format_compact!("{} like ?", Self::MENU_CODE), &pmc) // 添加条件，代码以指定字符串开头
+            )
             .build();
 
-        query_one_sql(&sql, &params).await
+        gensql::sql_query_one(sql, params).await // 执行查询并等待结果
     }
 
-    pub async fn batch_update_rearrange(menus: &[SysMenu]) -> Result<()> {
-        let sql = format!("update {} set {} = ? where {} = ?",
-                Self::TABLE, Self::MENU_CODE, Self::MENU_ID);
+    /// 批量更新菜单排列顺序
+    ///
+    /// Arguments:
+    ///
+    /// * `menus`: 要更新的菜单记录
+    ///
+    pub async fn batch_update_rearrange(menus: &[SysMenu]) -> DbResult<()> {
+        let sql = format!(
+            "update {} set {} = ? where {} = ?",
+            Self::TABLE_NAME,
+            Self::MENU_CODE,
+            Self::MENU_ID
+        );
 
-        let mut conn = get_conn().await?;
-        let mut conn = conn.start_transaction().await?;
-        let trans = &mut conn;
+        let mut trans = gensql::start_transaction().await?;
 
         for item in menus.iter() {
-            let params = vec_value![item.menu_code, item.menu_id];
-            gensql::log_sql_params(&sql, &params);
-            trans.exec_sql(&sql, params).await?;
+            let params = gensql::to_values![item.menu_code, item.menu_id];
+            gensql::db_log_sql_params(&sql, &params);
+            trans.exec(&sql, params).await?;
         }
 
-        conn.commit().await?;
+        trans.commit().await?;
 
         Ok(())
     }
+}
 
+// 订阅菜单变化频道，实现菜单变化时清空缓存
+async fn subscribe_init() -> bool {
+    let channel = rmq::make_channel(rmq::ChannelName::ModMenu);
+    let chan_id = rmq::subscribe(channel, |_| async move {
+        let cache_key_pre = format_compact!("{}:{}:*", AppConf::get().cache_pre, rcache::CK_MENUS);
+        let keys = rcache::keys(&cache_key_pre).await;
+        log::trace!("收到菜单变化消息, 删除缓存项: {keys:?}");
+        if let Some(keys) = keys {
+            rcache::del(&keys).await;
+        }
+        Ok(())
+    })
+    .await
+    .expect("订阅菜单变化频道失败");
+
+    if chan_id == 0 {
+        log::error!("订阅菜单变化频道失败: 该频道已经被订阅");
+    }
+
+    true
 }

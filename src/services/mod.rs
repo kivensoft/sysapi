@@ -1,3 +1,3 @@
 pub mod rcache;
-pub mod rpc;
+pub mod rcall;
 pub mod rmq;

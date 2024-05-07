@@ -1,9 +1,9 @@
 pub mod account;
 pub mod api;
-pub mod auth;
 pub mod config;
 pub mod debug;
 pub mod dict;
+pub mod login;
 pub mod menu;
 pub mod permission;
 pub mod role;

@@ -75,7 +75,11 @@ pub fn find(hex: &str, value: bool) -> Option<usize> {
 pub fn find_range(hex: &str, value: bool, start: usize, end: usize) -> Option<usize> {
     let hex = hex.as_bytes();
     let hex_bits_len = hex.len() << 2;
-    let end = if end > hex_bits_len { hex_bits_len } else { end };
+    let end = if end > hex_bits_len {
+        hex_bits_len
+    } else {
+        end
+    };
 
     if start >= end {
         return None;
@@ -103,15 +107,31 @@ pub fn find_range(hex: &str, value: bool, start: usize, end: usize) -> Option<us
         // }
         // 改成循环展开, 能让运算速度快上一些
         if value {
-            if (b & 8) != 0 { return Some(pos); }
-            if (b & 4) != 0 { return Some(pos + 1); }
-            if (b & 2) != 0 { return Some(pos + 2); }
-            if (b & 1) != 0 { return Some(pos + 3); }
+            if (b & 8) != 0 {
+                return Some(pos);
+            }
+            if (b & 4) != 0 {
+                return Some(pos + 1);
+            }
+            if (b & 2) != 0 {
+                return Some(pos + 2);
+            }
+            if (b & 1) != 0 {
+                return Some(pos + 3);
+            }
         } else {
-            if (b & 8) == 0 { return Some(pos); }
-            if (b & 4) == 0 { return Some(pos + 1); }
-            if (b & 2) == 0 { return Some(pos + 2); }
-            if (b & 1) == 0 { return Some(pos + 3); }
+            if (b & 8) == 0 {
+                return Some(pos);
+            }
+            if (b & 4) == 0 {
+                return Some(pos + 1);
+            }
+            if (b & 2) == 0 {
+                return Some(pos + 2);
+            }
+            if (b & 1) == 0 {
+                return Some(pos + 3);
+            }
         }
         pos += 4;
     }
@@ -160,7 +180,11 @@ pub fn last_find_range(hex: &str, value: bool, start: usize, end: usize) -> Opti
     let hex = hex.as_bytes();
     let hex_bits_len = hex.len() << 2;
     let start = start as isize;
-    let end = if end > hex_bits_len { hex_bits_len } else { end } as isize;
+    let end = if end > hex_bits_len {
+        hex_bits_len
+    } else {
+        end
+    } as isize;
 
     if start >= end {
         return None;
@@ -182,7 +206,7 @@ pub fn last_find_range(hex: &str, value: bool, start: usize, end: usize) -> Opti
             return Some(pos as usize + idx);
         }
     }
-    pos -=4;
+    pos -= 4;
 
     // 处理4对齐的bit
     while pos >= start {
@@ -208,7 +232,9 @@ pub fn last_find_range(hex: &str, value: bool, start: usize, end: usize) -> Opti
 /// bool数组转成16进制字符串
 pub fn bools_to_string(val: &[bool]) -> String {
     let vlen = val.len();
-    if vlen == 0 { return String::new(); }
+    if vlen == 0 {
+        return String::new();
+    }
 
     // 位对齐,不足8位则补齐8位,得到需要的字节长度
     let blen = (vlen + 7) >> 3 << 1;
@@ -219,10 +245,18 @@ pub fn bools_to_string(val: &[bool]) -> String {
     for (i, item) in chars.iter_mut().enumerate().take(vlen >> 3 << 1) {
         let mut b = 0;
         let idx = i << 2;
-        if val[idx] { b |= 8; }
-        if val[idx + 1] { b |= 4; }
-        if val[idx + 2] { b |= 2; }
-        if val[idx + 3] { b |= 1; }
+        if val[idx] {
+            b |= 8;
+        }
+        if val[idx + 1] {
+            b |= 4;
+        }
+        if val[idx + 2] {
+            b |= 2;
+        }
+        if val[idx + 3] {
+            b |= 1;
+        }
         *item = if b < 10 { 48 + b } else { 87 + b };
     }
 
@@ -266,7 +300,9 @@ pub fn bools_to_compact_string(val: &[bool]) -> String {
 pub fn string_to_bools(hex: &str) -> Vec<bool> {
     let hex_len = hex.len();
     let hex = hex.as_bytes();
-    if hex_len == 0 { return Vec::new(); }
+    if hex_len == 0 {
+        return Vec::new();
+    }
 
     // 生成bool数组并设置初始值
     let bits_len = hex_len << 2;
@@ -276,10 +312,18 @@ pub fn string_to_bools(hex: &str) -> Vec<bool> {
     for (i, item) in hex.iter().enumerate().take(hex_len) {
         let b = c2b(*item);
         let idx = i << 2;
-        if (b & 8) != 0 { ret[idx] = true; }
-        if (b & 4) != 0 { ret[idx + 1] = true; }
-        if (b & 2) != 0 { ret[idx + 2] = true; }
-        if (b & 1) != 0 { ret[idx + 3] = true; }
+        if (b & 8) != 0 {
+            ret[idx] = true;
+        }
+        if (b & 4) != 0 {
+            ret[idx + 1] = true;
+        }
+        if (b & 2) != 0 {
+            ret[idx + 2] = true;
+        }
+        if (b & 1) != 0 {
+            ret[idx + 3] = true;
+        }
     }
 
     ret
@@ -307,10 +351,11 @@ fn last_find_in_byte(b: u8, val: bool, off: usize, len: usize) -> Option<usize> 
 
 /// 16进制表示的字符转成二进制表示
 fn c2b(mut c: u8) -> u8 {
-    if (c & 64) != 0 { c += 9 }
+    if (c & 64) != 0 {
+        c += 9
+    }
     c & 15
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -320,9 +365,9 @@ mod tests {
         let hex_data = "1248";
         for i in 1..15 {
             if i % 3 == 0 {
-                assert_eq!(true, super::get(hex_data, i));
+                assert!(super::get(hex_data, i));
             } else {
-                assert_eq!(false, super::get(hex_data, i));
+                assert!(!super::get(hex_data, i));
             }
         }
     }
@@ -333,7 +378,7 @@ mod tests {
         for i in 1..15 {
             if i % 3 == 0 {
                 super::set(&mut hex_data, i, true);
-                assert_eq!((i as usize + 8) >> 3 << 1, hex_data.len());
+                assert_eq!((i + 8) >> 3 << 1, hex_data.len());
             }
         }
 
@@ -390,42 +435,54 @@ mod tests {
 
     #[test]
     fn test_bits_bools_to_string() {
-        assert_eq!("1248", super::bools_to_string(&vec![
-            false, false, false, true,
-            false, false, true, false,
-            false, true, false, false,
-            true, false, false, false]));
+        assert_eq!(
+            "1248",
+            super::bools_to_string(&[
+                false, false, false, true, false, false, true, false, false, true, false, false,
+                true, false, false, false
+            ])
+        );
 
-        assert_eq!("1240", super::bools_to_compact_string(&vec![
-            false, false, false, true,
-            false, false, true, false,
-            false, true, false, false,
-            false, false, false, false]));
+        assert_eq!(
+            "1240",
+            super::bools_to_compact_string(&[
+                false, false, false, true, false, false, true, false, false, true, false, false,
+                false, false, false, false
+            ])
+        );
 
-        assert_eq!("12", super::bools_to_compact_string(&vec![
-            false, false, false, true,
-            false, false, true, false,
-            false, false, false, false,
-            false, false, false, false]));
+        assert_eq!(
+            "12",
+            super::bools_to_compact_string(&[
+                false, false, false, true, false, false, true, false, false, false, false, false,
+                false, false, false, false
+            ])
+        );
 
-        assert_eq!("1240", super::bools_to_compact_string(&vec![
-            false, false, false, true,
-            false, false, true, false,
-            false, true]));
+        assert_eq!(
+            "1240",
+            super::bools_to_compact_string(&[
+                false, false, false, true, false, false, true, false, false, true
+            ])
+        );
     }
 
     #[test]
     fn test_bits_string_to_bools() {
-        assert_eq!(vec![
-            false, false, false, true,
-            false, false, true, false,
-            false, true, false, false,
-            true, false, false, false], super::string_to_bools("1248"));
+        assert_eq!(
+            vec![
+                false, false, false, true, false, false, true, false, false, true, false, false,
+                true, false, false, false
+            ],
+            super::string_to_bools("1248")
+        );
 
-        assert_eq!(vec![
-            false, false, false, true,
-            false, false, true, false,
-            false, true, false, false,
-            false, false, false, false], super::string_to_bools("1240"));
+        assert_eq!(
+            vec![
+                false, false, false, true, false, false, true, false, false, true, false, false,
+                false, false, false, false
+            ],
+            super::string_to_bools("1240")
+        );
     }
 }

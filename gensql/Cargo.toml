@@ -1,13 +1,13 @@
 [package]
 name = "gensql"
-version = "1.0.0"
+version = "1.0.2"
 edition = "2021"
 authors = ["kiven <kivensoft@gmail.com>"]
 description = "A simple sql generator library"
 
 [features]
 default = ["mysql"]
-mysql = ["mysql_common", "mysql_async"]
+mysql = ["mysql_async", "mysql_common"]
 
 [dependencies]
 cfg-if = "1.0"
@@ -19,9 +19,10 @@ futures = "0.3"
 serde = { version = "1.0", features = ["derive", "rc"] }
 parking_lot = "0.12"
 rclite = "0.2"
-mysql_common = { version = "0.29", optional = true }
-mysql_async = { version = "0.31", optional = true, default-features = false }
+mysql_async = { version = "0.33", default-features = false, features = ["derive"], optional = true }
+mysql_common = { version = "0.31", default-features = false, features = ["bigdecimal", "rust_decimal", "time", "derive"], optional = true }
+flate2 = {version = "1.0", default-features = false, features = ["rust_backend"]}
 itoa = "1.0"
 smallvec = { version = "1.10", features = ["write"] }
 compact_str = { version = "0.7", features = ["serde", "bytes"] }
-gensql_derive = { version = "1.0", path = "gensql_derive" } # sql语句生成库
+gensql_derive = { version = "1.0.0", path = "gensql_derive" } # sql语句生成库

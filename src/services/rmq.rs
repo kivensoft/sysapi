@@ -1,16 +1,21 @@
 //! redis 消息队列服务
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, OnceLock,
+    },
+    vec,
+};
 
-use std::{collections::HashMap, sync::{atomic::{AtomicBool, Ordering}, Arc}, vec};
-
-use anyhow::{Context, Result};
-use compact_str::{CompactString, format_compact};
-use deadpool_redis::redis::{aio::PubSub, Msg, Client, Cmd};
+use anyhow_ext::{Context, Result};
+use compact_str::{format_compact, CompactString};
+use deadpool_redis::redis::{aio::PubSub, Client, Cmd, Msg};
 use futures_util::StreamExt;
-use tokio::sync::{Mutex, mpsc, OnceCell};
-use parking_lot::Mutex as PlMutex;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::AppConf;
 use super::rcache;
+use crate::AppConf;
 
 pub enum ChannelName {
     ModApi,
@@ -24,34 +29,41 @@ pub enum ChannelName {
     Logout,
 }
 
+#[derive(Debug)]
+pub struct MqMsg(Msg);
+
 #[async_trait::async_trait]
-pub trait RedisOnMessage: Send + Sync + 'static {
-    async fn handle(&self, msg: Arc<Msg>) -> Result<()>;
+pub trait MsgQueueEvent: Send + Sync + 'static {
+    async fn handle(&self, msg: Arc<MqMsg>) -> Result<()>;
 }
 
-#[derive(Clone)]
+pub struct ChanBuilder (CompactString);
+
 struct FuncItem {
-    id: u32,
-    func: Arc<dyn RedisOnMessage>,
+    id: u32,    // 订阅的唯一id
+    func: Func, // 消息处理函数
 }
 
+type Func = Arc<dyn MsgQueueEvent>;
 type FuncMap = HashMap<CompactString, Vec<FuncItem>>;
 
-struct MessageMap {
-    modified: AtomicBool, // 修改标志, 用于消除异步中多次调用subscribe订阅造成反复注册的操作
-    id:       u32,        // 最后插入消息对象ID，用于funcs和pfuncs插入
-    funcs:    FuncMap,    // 完全匹配的频道/消息处理函数
-    pfuncs:   FuncMap,    // 前缀匹配的频道/消息处理函数
+enum ModData {
+    Insert(u32, CompactString, Func),
+    Delete(u32),
+    Quit,
+}
+
+struct AllFuncMap {
+    funcs: FuncMap,       // 完全匹配的频道/消息处理函数
+    pfuncs: FuncMap,      // 前缀匹配的频道/消息处理函数
 }
 
 struct GlobalVal {
-    pubsub:  Mutex<PubSub>,               // redis消息订阅对象
-    msg_map: PlMutex<Arc<MessageMap>>,    // 频道/处理函数对象
-    tx:      mpsc::UnboundedSender<bool>, // 接收重新订阅消息的通道
+    tx: UnboundedSender<ModData>,       // 接收重新订阅消息的通道
+    next_id: AtomicU32,                 // 下一个订阅消息的id
 }
 
-static GLOBAL_VAL: Option<GlobalVal> = None;
-static GLOBAL_VAL_INIT: OnceCell<bool> = OnceCell::const_new();
+static GLOBAL_VAL: OnceLock<GlobalVal> = OnceLock::new();
 
 /// 订阅消息, 当末尾为'*'时, 表示通配符模式订阅. 相同的频道只能被订阅1次,
 /// 当频道存在时, 订阅失败
@@ -68,32 +80,12 @@ static GLOBAL_VAL_INIT: OnceCell<bool> = OnceCell::const_new();
 /// * `Ok(false)`: 订阅失败, 该频道已被订阅
 /// * `Err(e)`: 其它错误
 #[allow(dead_code)]
-pub async fn subscribe(chan: CompactString, func: impl RedisOnMessage) -> Result<u32> {
+pub async fn subscribe(chan: CompactString, func: impl MsgQueueEvent) -> Result<u32> {
     debug_assert!(!chan.is_empty());
-    global_init().await;
 
-    let mut msg_map = global_val().msg_map.lock();
-    let mut new_msg_map = msg_map.as_ref().clone();
-    let id = msg_map.id + 1;
-    let cbs = chan.as_bytes();
-    let func = Arc::new(func);
-
-    let funcs = if cbs[cbs.len() - 1] == b'*' {
-        &mut new_msg_map.pfuncs
-    } else {
-        &mut new_msg_map.funcs
-    };
-
-    // 添加新的订阅频道
-    funcs.entry(chan)
-        .and_modify(|v| v.push(FuncItem { id, func: func.clone() }))
-        .or_insert_with(|| vec!(FuncItem { id, func }));
-
-    // 需要订阅的频道尚未有人订阅, 可以订阅
-    new_msg_map.modified.store(true, Ordering::Release);
-    new_msg_map.id = id;
-    *msg_map = Arc::new(new_msg_map);
-    global_val().tx.send(false)?;
+    let gv = global_val();
+    let id = gv.next_id.fetch_add(1, Ordering::Acquire);
+    gv.tx.send(ModData::Insert(id, chan, Arc::new(func)))?;
 
     Ok(id)
 }
@@ -117,31 +109,18 @@ pub async fn unsubscribe(id: u32) -> Result<()> {
 ///
 #[allow(dead_code)]
 pub async fn unsubscribe_slice(ids: &[u32]) -> Result<()> {
-    global_init().await;
-
-    let mut msg_map = global_val().msg_map.lock();
-    let mut new_msg_map = msg_map.as_ref().clone();
-    let mut modified = false;
-    let f = |v: &mut Vec<FuncItem>, id: u32, modi: &mut bool| {
-        v.retain(|v2| {
-            *modi = v2.id == id;
-            !*modi
-        });
-        !v.is_empty()
-    };
-
+    let gv = global_val();
     for id in ids {
-        new_msg_map.pfuncs.retain(|_, v| f(v, *id, &mut modified));
-        new_msg_map.funcs.retain(|_, v| f(v, *id, &mut modified));
-    }
-
-    if modified {
-        new_msg_map.modified.store(true, Ordering::Release);
-        *msg_map = Arc::new(new_msg_map);
-        global_val().tx.send(false)?;
+        gv.tx.send(ModData::Delete(*id))?;
     }
 
     Ok(())
+}
+
+/// 停止监听服务
+#[allow(dead_code)]
+pub async fn stop() -> Result<()> {
+    Ok(global_val().tx.send(ModData::Quit)?)
 }
 
 /// 生成订阅频道(使用统一的应用前缀)
@@ -156,52 +135,92 @@ pub async fn unsubscribe_slice(ids: &[u32]) -> Result<()> {
 #[allow(dead_code)]
 pub fn make_channel(sub_channel: ChannelName) -> CompactString {
     let sub_channel = match sub_channel {
-        ChannelName::ModApi        => "modified:api",
-        ChannelName::ModConfig     => "modified:config",
-        ChannelName::ModDict       => "modified:dict",
+        ChannelName::ModApi => "modified:api",
+        ChannelName::ModConfig => "modified:config",
+        ChannelName::ModDict => "modified:dict",
         ChannelName::ModPermission => "modified:permission",
-        ChannelName::ModRole       => "modified:role",
-        ChannelName::ModUser       => "modified:user",
-        ChannelName::ModMenu       => "modified:menu",
-        ChannelName::Login         => "event.login",
-        ChannelName::Logout        => "event.logout",
+        ChannelName::ModRole => "modified:role",
+        ChannelName::ModUser => "modified:user",
+        ChannelName::ModMenu => "modified:menu",
+        ChannelName::Login => "event:login",
+        ChannelName::Logout => "event:logout",
     };
 
     format_compact!("{}:{}", AppConf::get().cache_pre, sub_channel)
 }
 
+/// 发送redis消息
 #[allow(dead_code)]
 pub async fn publish(channel: &str, message: &str) -> Result<()> {
     let mut conn = rcache::get_conn().await?;
     let cmd = Cmd::publish(channel, message);
     match cmd.query_async(&mut conn).await {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            log::error!("redis publish error: {e:?}");
-            anyhow::bail!("系统内部错误, 发布消息操作失败")
+        Ok(v) => {
+            log::trace!("发送redis消息成功: chan = {}, msg = {}", channel, message);
+            Ok(v)
         }
+        Err(e) => {
+            log::error!(
+                "redis publish error: chan = {}, msg = {}, err = {:?}",
+                channel,
+                message,
+                e
+            );
+            anyhow_ext::bail!("系统内部错误, 发布消息操作失败")
+        }
+    }
+}
+
+/// 使用异步方式发送消息，无需等待消息发送完成立即返回
+#[allow(dead_code)]
+pub fn publish_async(channel: CompactString, message: String) {
+    tokio::spawn(async move {
+        let (chan, msg) = (channel, message);
+        let _ = publish(&chan, &msg).await;
+    });
+}
+
+impl MqMsg {
+    #[allow(dead_code)]
+    pub fn get_channel(&self) -> &str {
+        self.0.get_channel_name()
+    }
+
+    #[allow(dead_code)]
+    pub fn get_payload(&self) -> &[u8] {
+        self.0.get_payload_bytes()
+    }
+
+    #[allow(dead_code)]
+    pub fn get_pattern(&self) -> Result<String> {
+        Ok(self.0.get_pattern()?)
+    }
+}
+
+#[allow(dead_code)]
+impl ChanBuilder {
+    pub fn new() -> Self {
+        Self(CompactString::with_capacity(0))
+    }
+
+    pub fn build(self) -> CompactString {
+        self.0
+    }
+
+    pub fn path(mut self, path: &str) -> Self {
+        self.0.push_str(path);
+        self
     }
 }
 
 #[async_trait::async_trait]
-impl<FN: Send + Sync + 'static, Fut> RedisOnMessage for FN
+impl<FN: Send + Sync + 'static, Fut> MsgQueueEvent for FN
 where
-    FN: Fn(Arc<Msg>) -> Fut,
-    Fut: std::future::Future<Output = Result<()>> + Send + 'static, {
-
-    async fn handle(&self, msg: Arc<Msg>) -> Result<()> {
+    FN: Fn(Arc<MqMsg>) -> Fut,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    async fn handle(&self, msg: Arc<MqMsg>) -> Result<()> {
         self(msg).await
-    }
-}
-
-impl Clone for MessageMap {
-    fn clone(&self) -> Self {
-        Self {
-            modified: AtomicBool::new(self.modified.load(Ordering::Relaxed)),
-            id: self.id.clone(),
-            funcs: self.funcs.clone(),
-            pfuncs: self.pfuncs.clone()
-        }
     }
 }
 
@@ -212,155 +231,161 @@ fn gen_url(ac: &AppConf) -> String {
     )
 }
 
-/// 初始化消息订阅相关全局变量
-async fn init_sub_data() -> Result<()> {
-    let url = gen_url(AppConf::get());
-    let client = Client::open(url).context("创建redis连接失败")?;
-    let conn = client.get_async_connection().await.context("获取redis连接失败")?;
-    let pubsub = Mutex::new(conn.into_pubsub());
-
-    let msg_map = PlMutex::new(Arc::new(MessageMap {
-        modified: AtomicBool::new(false),
-        id: 0,
-        funcs: HashMap::new(),
-        pfuncs: HashMap::new(),
-    }));
-    let (tx, rx) = mpsc::unbounded_channel();
-
-    unsafe {
-        let gval = &GLOBAL_VAL as *const Option<GlobalVal> as *mut Option<GlobalVal>;
-        *gval = Some(GlobalVal {pubsub, msg_map, tx});
-    }
-
-    tokio::task::spawn(msg_loop(rx));
-
-    Ok(())
-}
-
 /// redis异步消息处理函数
-async fn msg_loop(mut rx: mpsc::UnboundedReceiver<bool>) {
+async fn msg_loop(mut rx: UnboundedReceiver<ModData>) {
+    let mut pubsub = {
+        let url = gen_url(AppConf::get());
+        let client = Client::open(url).expect("创建redis连接失败");
+        client.get_async_pubsub().await.expect("获取redis消息订阅流失败")
+    };
+    let mut all_func_map = AllFuncMap { funcs: HashMap::new(), pfuncs: HashMap::new() };
+    let mut curr_recv = None;
+
     loop {
         // 注册map中所有订阅事件
-        subscribe_to_redis().await.expect("redis注册频道失败");
+        if let Some(recv) = curr_recv.take() {
+            match recv {
+                ModData::Insert(id, chan, func) =>
+                    redis_subscribe(&mut pubsub, &mut all_func_map, id, chan, func).await,
+                ModData::Delete(id) =>
+                    redis_unsubscribe(&mut pubsub, &mut all_func_map, id).await,
+                ModData::Quit => return,
+            }
+        }
 
         // 获取redis事件订阅对象
-        let mut pubsub = global_val().pubsub.lock().await;
         let mut pstream = pubsub.on_message();
 
         loop {
             tokio::select! {
                 // 收到订阅消息, 调用相应的消息处理函数
-                Some(msg) = pstream.next() => on_message(msg).await,
+                Some(msg) = pstream.next() => {
+                    if let Err(e) = on_message(&all_func_map, msg).await {
+                        log::error!("[redis:on_message] 发生错误: {e:?}");
+                    }
+                }
 
-                // 收到停止订阅消息, false表示订阅频道有变化, 需要重新订阅, true表示停止订阅
-                Some(flag) = rx.recv() =>
-                    if flag {
-                        log::trace!("结束redis消息订阅处理");
-                        return;
-                    } else {
-                        log::trace!("暂停redis消息处理");
-                        break;
-                    },
+                // 收到更新订阅消息，需要退出内层循环才能获取pubsub变量进行操作
+                Some(data) = rx.recv() => {
+                    curr_recv = Some(data);
+                    break;
+                }
             };
         }
     }
 }
 
-/// 订阅MSG_MAP中的所有频道
-async fn subscribe_to_redis() -> Result<()> {
-    let msg_map = global_val().msg_map.lock().clone();
-    let modified = msg_map.modified.compare_exchange(
-        true, false, Ordering::Acquire, Ordering::Relaxed
-    ).unwrap_or(false);
-
-    // 异步订阅, 会出现多个协程订阅产生反复订阅/取消的操作
-    // 加个modified标志, 有利于合并同时进行的订阅操作
-    if modified {
-        let mut pubsub = global_val().pubsub.lock().await;
-
-        let keys: Vec<_> = msg_map.funcs.keys().map(|v| v.as_str()).collect();
-        if !keys.is_empty() {
-            pubsub.subscribe(&keys).await?;
-            log::trace!("订阅redis消息：{:?}", keys);
-        }
-
-        let keys: Vec<_> = msg_map.pfuncs.keys().map(|v| v.as_str()).collect();
-        if !keys.is_empty() {
-            pubsub.subscribe(&keys).await?;
-            log::trace!("订阅redis消息：{:?}", keys);
-        }
+async fn redis_subscribe(pubsub: &mut PubSub, all_func_map: &mut AllFuncMap,
+    id: u32, chan: CompactString, func: Func)
+{
+    let cbs = chan.as_bytes();
+    let funcs = if cbs[cbs.len() - 1] == b'*' {
+        &mut all_func_map.pfuncs
     } else {
-        log::trace!("所有频道均已订阅, 无需再次订阅")
+        &mut all_func_map.funcs
+    };
+    let mut is_new = false;
+    let func_item = FuncItem { id, func };
+
+    match funcs.entry(chan.clone()) {
+        Entry::Occupied(mut v) => v.get_mut().push(func_item),
+        Entry::Vacant(v) => {
+            is_new = true;
+            v.insert(vec![func_item]);
+        },
     }
 
-    Ok(())
+    if is_new {
+        match pubsub.subscribe(chan.as_str()).await {
+            Ok(_) => log::debug!("订阅频道[id:{}]: {}", id, chan),
+            Err(e) => {
+                remove_func_by_id(all_func_map, id);
+                log::error!("redis订阅失败: chan = {}, error = {:?}", chan, e);
+            }
+        }
+    }
+}
+
+async fn redis_unsubscribe(pubsub: &mut PubSub, all_func_map: &mut AllFuncMap, id: u32) {
+    let chan = remove_func_by_id(all_func_map, id);
+
+    if !chan.is_empty() {
+        match pubsub.unsubscribe(chan.as_str()).await {
+            Ok(_) => log::debug!("取消订阅[id:{}]: {}", id, chan),
+            Err(e) => log::error!("redis取消订阅失败: id = {}, chan = {}, error = {:?}", id, chan, e),
+        }
+    }
+}
+
+fn remove_func_by_id(all_func_map: &mut AllFuncMap, id: u32) -> CompactString {
+    let mut chan = CompactString::with_capacity(0);
+
+    let find_fn = |k: &CompactString, v: &mut Vec<FuncItem>, chan: &mut CompactString| {
+        let old_len = v.len();
+        v.retain(|v2| v2.id != id);
+        if old_len != v.len() {
+            chan.push_str(k);
+        }
+        !v.is_empty()
+    };
+
+    all_func_map.funcs.retain(|k, v| find_fn(k, v, &mut chan));
+
+    if chan.is_empty() {
+        all_func_map.pfuncs.retain(|k, v| find_fn(k, v, &mut chan));
+    }
+
+    chan
 }
 
 /// 收到订阅频道的消息后的处理函数
-async fn on_message(msg: Msg) {
-    const ON_MSG: &str = "[on_message]";
-
+async fn on_message(all_func_map: &AllFuncMap, msg: Msg) -> Result<()> {
     // 获取频道
-    let chan = if msg.from_pattern() {
-        msg.get_pattern()
-    } else {
-        msg.get_channel()
-    };
-    let chan: String = match chan {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("{} 解析channel出错: {e:?}", ON_MSG);
-            return;
-        },
-    };
+    let chan = msg.get_channel_name();
+    let pchan: Option<String> = msg.get_pattern().context("解析pattern出错")?;
 
     // 记录日志
-    if log::log_enabled!(log::Level::Trace) {
-        let payload: String = match msg.get_payload() {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("{} 解析payload出错: {e:?}", ON_MSG);
-                return;
-            },
-        };
-        log::trace!("{} 收到redis消息: [{}] => [{}]", ON_MSG, chan, payload);
-    }
+    log::trace!(
+        "收到redis消息: [{}] => [{}]",
+        chan,
+        std::str::from_utf8(msg.get_payload_bytes()).unwrap_or_default()
+    );
 
-    let msg_map = global_val().msg_map.lock().clone();
-
-    let func_vec = if msg.from_pattern() {
-        msg_map.pfuncs.get(chan.as_str())
-    } else {
-        msg_map.funcs.get(chan.as_str())
+    let func_vec = match &pchan {
+        Some(pchan) => all_func_map.pfuncs.get(pchan.as_str()),
+        None => all_func_map.funcs.get(chan),
     };
 
     match func_vec {
         Some(func_vec) => {
-            let msg = Arc::new(msg);
+            let msg = Arc::new(MqMsg(msg));
+
             // 调用该频道下所有的回调函数
-            for fi in func_vec {
-                if let Err(e) = fi.func.handle(msg.clone()).await {
-                    log::error!("redis消息处理失败: {e:?}");
-                }
+            for fi in func_vec.iter() {
+                let id = fi.id;
+                let func = fi.func.clone();
+                let m = msg.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = func.handle(m).await {
+                        log::error!("mq callback error[id:{}]: {}", id, e);
+                    }
+                });
             }
-        },
-        None => log::trace!("{} 消息{}没有定义响应的处理函数", ON_MSG, chan),
+        }
+        None => log::warn!("redis消息{}没有定义响应的处理函数", chan),
     };
 
-}
-
-async fn global_init() {
-    GLOBAL_VAL_INIT.get_or_init(|| async {
-        init_sub_data().await.expect("初始化redis消息订阅全局对象失败");
-        true
-    }).await;
+    Ok(())
 }
 
 fn global_val() -> &'static GlobalVal {
-    unsafe {
-        match &GLOBAL_VAL {
-            Some(v) => v,
-            None => std::hint::unreachable_unchecked(),
+    GLOBAL_VAL.get_or_init(|| {
+        let (tx, rx) = unbounded_channel();
+        tokio::task::spawn(msg_loop(rx));
+
+        GlobalVal {
+            tx,
+            next_id: AtomicU32::new(1)
         }
-    }
+    })
 }

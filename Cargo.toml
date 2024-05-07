@@ -20,22 +20,23 @@ panic = 'abort'
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-# default = ["current_thread"]
-# current_thread = []
+# default = ["fast_qr"]
+default = ["multi_thread"]
 multi_thread = []
 
 [dependencies]
-tokio = { version = "1.27", features = ["full"] } # 最流行的异步io库
-hyper = { version = "0.14", features = ["http1", "client"] } # 最流行的底层http协议库
+tokio = { version = "1.36", features = ["full"] } # 最流行的异步io库
+hyper = { version = "1.1", features = ["http1", "client"] } # 最流行的底层http协议库
+hyper-util = { version = "0.1", features = [ "client", "client-legacy" ] }
+http-body-util = "0.1" # hyper库的body扩展
 serde = { version = "1.0", features = ["derive", "rc"] } # 最流行的序列化反序列化库
 serde_json = "1.0" # 最流行的json序列化反序列化库
 serde_repr = "0.1" # 将枚举序列化和反序列化成整数
-urlencoding = "2.1" # url编解码库
-querystring = "1.1" # url参数解析库
-cookie = { version = "0.17", features = ["percent-encode"] } # http cookie库
-base64 = "0.21" # base64编解码库
+form_urlencoded = "1.2" # url编解码库
+cookie = { version = "0.18", features = ["percent-encode"] } # http cookie库
+base64 = "0.22" # base64编解码库
 md-5 = "0.10" # 基于rust-crypto的md5算法库
-anyhow = "1.0" # 最流行的错误处理库
+anyhow_ext = "0.2" # 最流行的错误处理库
 log = "0.4" # 日志门面库，官方标准
 cfg-if = "1.0" # 条件编译宏
 # chrono = { version = "0.4", features = ["serde"] } # 最流行的日期时间库
@@ -48,18 +49,21 @@ lazy_static = "1.4" # 广泛被使用的静态变量初始化库
 parking_lot = "0.12" # 性能更好的替代标准库Mutex/RwLock的三方库
 rclite = "0.2" # 比标准库的Arc更轻量的替代类
 rand = "0.8" # 最广泛使用的随机数生成库
-# mini-moka = "0.10" # 轻量的缓存库
 smallvec = { version = "1.10", features = ["write"] } # 基于栈的动态数组
 smallstr = "0.3" # 基于栈的字符串
 itoa = "1.0" # 非常快速的整数转字符串库
-lru = { version = "0.10", default-features = false } # 简单迷你的lru缓存库
-deadpool-redis = { version = "0.11" } # redis 连接池
-flate2 = { version = "1.0", features = ["rust_backend"] }
-fast_qr = { version = "0.8", features = ["image"] }
-appconfig = { version = "1.0", git = "https://gitee.com/kivensoft/appconfig_rs.git" } # 支持命令行参数解析和配置文件参数解析的库
+mini-moka = "0.10" # 轻量级缓存库，rust版本的Caffeine实现
+dashmap = "5.5" # 高性能线程安全map
+fnv = "1.0" # 比标准库使用的hash更快，适用小数据量
+arc-swap = "1.7" # 类似Arc<T>的高性能库
+deadpool-redis = { version = "0.15" } # redis 连接池
+# flate2 = { version = "1.0" } # 纯rust实现的gzip压缩库
+fast_qr = { version = "0.12", features = ["image"], optional = true } # 最快速的二维码生成器
+lz4_flex = "0.11" # 最快速的压缩算法
+appconfig = { version = "1.0", features = ["chinese"], git = "https://gitee.com/kivensoft/appconfig_rs.git" } # 支持命令行参数解析和配置文件参数解析的库
 ansicolor = { version = "1.0", git = "https://gitee.com/kivensoft/ansicolor_rs.git" } # 支持终端ansi颜色的库
-asynclog = { version = "1.0", git = "https://gitee.com/kivensoft/asynclog_rs.git" } # 支持同步和异步两种方式的迷你日志实现库
-localtime = { version = "1.0", git = "https://gitee.com/kivensoft/localtime_rs.git", features = ["mysql_common"] } # 本地时间序列化反序列化库
-jwt = { version = "1.0", git = "https://gitee.com/kivensoft/jwt_rs.git" } # 迷你的http库
+asynclog = { version = "1.0", features = ["tokio"], git = "https://gitee.com/kivensoft/asynclog_rs.git" } # 支持同步和异步两种方式的迷你日志实现库
+localtime = { version = "1.0.2", features = ["mysql_common"], git = "https://gitee.com/kivensoft/localtime_rs.git" } # 本地时间序列化反序列化库
+jwt = { version = "1.0.1", git = "https://gitee.com/kivensoft/jwt_rs.git" } # 迷你的http库
 httpserver = { version = "1.0", path = "httpserver" } # 迷你的http库
 gensql = { version = "1.0", path = "gensql" } # sql语句生成库

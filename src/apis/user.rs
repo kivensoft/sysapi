@@ -1,39 +1,35 @@
 //! 用户表接口
-
 use crate::{
-    entities::{PageQuery, sys_user::SysUser},
-    utils::{md5_crypt, pub_rec::{emit, type_from_id, RecChanged}},
-    services::rmq::ChannelName
+    entities::{sys_user::SysUser, PageQuery},
+    services::rmq::ChannelName,
+    utils::{
+        md5_crypt,
+        mq_util::{emit, RecChanged},
+    },
 };
-
-use httpserver::{HttpContext, Resp, HttpResult, check_result};
+use httpserver::{HttpContext, HttpResponse, Resp};
 use localtime::LocalTime;
 use serde::Serialize;
 
 /// 记录列表
-pub async fn list(ctx: HttpContext) -> HttpResult {
+pub async fn list(ctx: HttpContext) -> HttpResponse {
     type Req = PageQuery<SysUser>;
 
-    let param: Req = ctx.into_json().await?;
-    let page_data = SysUser::select_page(param.data(), param.to_page_info()).await;
-    let mut page_data = check_result!(page_data);
-
-    // 剔除不需要返回的字段
-    for item in page_data.list.iter_mut() {
-        item.password = None;
-    }
+    let param: Req = ctx.parse_json()?;
+    let pg = param.page_info();
+    let page_data = SysUser::select_page(param.inner, pg).await?;
 
     Resp::ok(&page_data)
 }
 
 /// 获取单条记录
-pub async fn get(ctx: HttpContext) -> HttpResult {
+pub async fn get(ctx: HttpContext) -> HttpResponse {
     type Req = super::GetReq;
 
-    let param: Req = ctx.into_json().await?;
-    let rec = SysUser::select_by_id(&param.id).await;
+    let param: Req = ctx.parse_json()?;
+    let rec = SysUser::select_by_id(param.id).await?;
 
-    match check_result!(rec) {
+    match rec {
         Some(mut rec) => {
             rec.password = None;
             Resp::ok(&rec)
@@ -42,68 +38,108 @@ pub async fn get(ctx: HttpContext) -> HttpResult {
     }
 }
 
-/// 更新单条记录
-pub async fn post(ctx: HttpContext) -> HttpResult {
+/// 添加单条记录
+pub async fn insert(ctx: HttpContext) -> HttpResponse {
     type Req = SysUser;
 
-    let mut param: Req = ctx.into_json().await?;
+    let rid = ctx.id;
+    let mut param: Req = ctx.parse_json()?;
 
     httpserver::check_required!(param, role_id, username, nickname, disabled);
 
-    if param.mobile.is_none() { param.mobile = Some("".to_owned()); }
-    if param.email.is_none() { param.email = Some("".to_owned()); }
-    if param.icon_id.is_none() { param.icon_id = Some("".to_owned()); }
+    param.user_id = None;
+    param.updated_time = Some(LocalTime::now());
+    param.created_time = Some(LocalTime::now());
+
+    if param.mobile.is_none() {
+        param.mobile = Some("".to_owned());
+    }
+    if param.email.is_none() {
+        param.email = Some("".to_owned());
+    }
+    if param.icon_id.is_none() {
+        param.icon_id = Some("".to_owned());
+    }
+
+    // 对口令进行加密
+    httpserver::check_required!(param, password);
+    let pwd = md5_crypt::encrypt(&param.password.unwrap())?;
+    param.password = Some(pwd);
+
+    let id = SysUser::insert(param).await?.1;
+
+    let res = SysUser {
+        user_id: Some(id),
+        ..Default::default()
+    };
+    emit(rid, ChannelName::ModUser, &RecChanged::with_insert(&res));
+
+    Resp::ok(&res)
+}
+
+/// 更新单条记录
+pub async fn update(ctx: HttpContext) -> HttpResponse {
+    type Req = SysUser;
+
+    let rid = ctx.id;
+    let mut param: Req = ctx.parse_json()?;
+
+    httpserver::check_required!(param, user_id, role_id, username, nickname, disabled);
+
+    if param.mobile.is_none() {
+        param.mobile = Some("".to_owned());
+    }
+    if param.email.is_none() {
+        param.email = Some("".to_owned());
+    }
+    if param.icon_id.is_none() {
+        param.icon_id = Some("".to_owned());
+    }
 
     param.updated_time = Some(LocalTime::now());
 
-    let id = check_result!(match param.user_id {
-        Some(id) => {
-            // 禁止更新的字段
-            param.password = None;
-            param.created_time = None;
+    // 禁止更新的字段
+    param.password = None;
+    param.created_time = None;
 
-            SysUser::update_dyn_by_id(&param).await.map(|_| id)
-        }
-        None => {
-            // 对口令进行加密
-            httpserver::check_required!(param, password);
-            let pwd = check_result!(md5_crypt::encrypt(&param.password.unwrap()));
-            param.password = Some(pwd);
+    let user_id = param.user_id;
+    SysUser::update_by_id_selective(param).await?;
 
-            param.created_time = Some(LocalTime::now());
-
-            SysUser::insert(&param).await.map(|(_, id)| id)
-        }
-    });
-
-    let res = SysUser { user_id: Some(id), ..Default::default() };
-    let type_ = type_from_id(&param.user_id);
-    emit(ChannelName::ModUser, &RecChanged::new(type_, &res));
+    let res = SysUser {
+        user_id,
+        ..Default::default()
+    };
+    emit(rid, ChannelName::ModUser, &RecChanged::with_update(&res));
 
     Resp::ok(&res)
 }
 
 /// 删除记录
-pub async fn del(ctx: HttpContext) -> HttpResult {
+pub async fn del(ctx: HttpContext) -> HttpResponse {
     type Req = super::GetReq;
 
-    let param: Req = ctx.into_json().await?;
-    let op = SysUser::delete_by_id(&param.id).await;
-    check_result!(op);
+    let rid = ctx.id;
+    let param: Req = ctx.parse_json()?;
+    SysUser::delete_by_id(param.id).await?;
 
-    emit(ChannelName::ModUser, &RecChanged::with_delete(&SysUser {
-        user_id: Some(param.id),
-        ..Default::default()
-    }));
+    emit(
+        rid,
+        ChannelName::ModUser,
+        &RecChanged::with_delete(&SysUser {
+            user_id: Some(param.id),
+            ..Default::default()
+        }),
+    );
 
     Resp::ok_with_empty()
 }
 
 /// 改变状态
-pub async fn change_disabled(ctx: HttpContext) -> HttpResult {
+pub async fn change_disabled(ctx: HttpContext) -> HttpResponse {
     type Req = SysUser;
 
-    let param: Req = ctx.into_json().await?;
+    let rid = ctx.id;
+    let param: Req = ctx.parse_json()?;
 
     httpserver::check_required!(param, user_id, disabled);
 
@@ -114,22 +150,27 @@ pub async fn change_disabled(ctx: HttpContext) -> HttpResult {
         ..Default::default()
     };
 
-    SysUser::update_dyn_by_id(&user).await?;
+    SysUser::update_by_id_selective(user).await?;
 
-    emit(ChannelName::ModUser, &RecChanged::with_update(&SysUser {
-        user_id: param.user_id,
-        ..Default::default()
-    }));
+    emit(
+        rid,
+        ChannelName::ModUser,
+        &RecChanged::with_update(&SysUser {
+            user_id: param.user_id,
+            ..Default::default()
+        }),
+    );
 
     Resp::ok_with_empty()
 }
 
 /// 重置密码
-pub async fn reset_password(ctx: HttpContext) -> HttpResult {
+pub async fn reset_password(ctx: HttpContext) -> HttpResponse {
     type Req = SysUser;
     type Res = SysUser;
 
-    let param: Req = ctx.into_json().await?;
+    let rid = ctx.id;
+    let param: Req = ctx.parse_json()?;
 
     httpserver::check_required!(param, user_id, password);
 
@@ -146,21 +187,25 @@ pub async fn reset_password(ctx: HttpContext) -> HttpResult {
         ..Default::default()
     };
 
-    SysUser::update_dyn_by_id(&user).await?;
+    SysUser::update_by_id_selective(user).await?;
 
-    emit(ChannelName::ModUser, &RecChanged::with_update(&SysUser {
-        user_id: param.user_id,
-        ..Default::default()
-    }));
+    emit(
+        rid,
+        ChannelName::ModUser,
+        &RecChanged::with_update(&SysUser {
+            user_id: param.user_id,
+            ..Default::default()
+        }),
+    );
 
-    Resp::ok( &Res {
+    Resp::ok(&Res {
         password: Some(pwd),
         ..Default::default()
     })
 }
 
 /// 获取指定类别的所有字典项
-pub async fn items(ctx: HttpContext) -> HttpResult {
+pub async fn items(ctx: HttpContext) -> HttpResponse {
     type Req = SysUser;
 
     #[derive(Serialize)]
@@ -169,8 +214,8 @@ pub async fn items(ctx: HttpContext) -> HttpResult {
         users: Vec<SysUser>,
     }
 
-    let param: Req = ctx.into_json().await?;
-    let recs = check_result!(SysUser::select_by(&param).await);
+    let param: Req = ctx.parse_json()?;
+    let recs = SysUser::select_by(param).await?;
 
     Resp::ok(&Res { users: recs })
 }

@@ -1,17 +1,17 @@
 //! 实用工具接口
-
-use crate::{AppGlobal, utils::md5_crypt, auth};
+use crate::{utils::md5_crypt, AppGlobal};
 use compact_str::{format_compact, CompactString, ToCompactString};
+#[cfg(feature = "fast_qr")]
 use fast_qr::{
     convert::{image::ImageBuilder, Builder, Shape},
     QRBuilder,
 };
-use httpserver::{HttpContext, Resp, HttpResult};
+use httpserver::{HttpContext, HttpResponse, Resp};
 use localtime::LocalTime;
 use serde::{Deserialize, Serialize};
 
 /// 服务测试，测试服务是否存活
-pub async fn ping(ctx: HttpContext) -> HttpResult {
+pub async fn ping(ctx: HttpContext) -> HttpResponse {
     #[derive(Deserialize)]
     struct Req {
         reply: Option<CompactString>,
@@ -25,7 +25,7 @@ pub async fn ping(ctx: HttpContext) -> HttpResult {
         server: CompactString,
     }
 
-    let reply = match ctx.into_opt_json::<Req>().await? {
+    let reply = match ctx.parse_json_opt::<Req>()? {
         Some(ping_params) => ping_params.reply,
         None => None,
     }
@@ -39,15 +39,15 @@ pub async fn ping(ctx: HttpContext) -> HttpResult {
 }
 
 /// 服务状态
-pub async fn status(ctx: HttpContext) -> HttpResult {
+pub async fn status(ctx: HttpContext) -> HttpResponse {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Res {
-        startup:      LocalTime,    // 服务启动时间
-        resp_count:   u32,          // 总响应次数
+        startup: LocalTime,         // 服务启动时间
+        resp_count: u32,            // 总响应次数
         content_path: &'static str, // 上下文路径
-        app_name:     &'static str, // 应用名称
-        app_ver:      &'static str, // 应用版本
+        app_name: &'static str,     // 应用名称
+        app_ver: &'static str,      // 应用版本
     }
 
     let app_global = AppGlobal::get();
@@ -55,14 +55,14 @@ pub async fn status(ctx: HttpContext) -> HttpResult {
     Resp::ok(&Res {
         startup: LocalTime::from_unix_timestamp(app_global.startup_time),
         resp_count: ctx.id,
-        content_path: auth::API_PATH_PRE,
+        content_path: crate::CONTENT_PATH,
         app_name: crate::APP_NAME,
         app_ver: crate::APP_VER,
     })
 }
 
 /// 获取客户端ip
-pub async fn ip(ctx: HttpContext) -> HttpResult {
+pub async fn ip(ctx: HttpContext) -> HttpResponse {
     #[derive(Serialize)]
     // #[serde(rename_all = "camelCase")]
     struct Res {
@@ -75,7 +75,10 @@ pub async fn ip(ctx: HttpContext) -> HttpResult {
 }
 
 /// 生成二维码
-pub async fn qrcode(ctx: HttpContext) -> HttpResult {
+#[cfg(feature = "fast_qr")]
+pub async fn qrcode(ctx: HttpContext) -> HttpResponse {
+    use http_body_util::{BodyExt, Full};
+
     #[derive(Deserialize, Serialize)]
     struct Req {
         text: String,
@@ -87,9 +90,9 @@ pub async fn qrcode(ctx: HttpContext) -> HttpResult {
         text: LocalTime,
     }
 
-    let param: Req = ctx.into_json().await?;
-    let width = param.width.unwrap_or(200);
 
+    let param: Req = ctx.parse_json()?;
+    let width = param.width.unwrap_or(200);
     let qrcode = QRBuilder::new(param.text).build()?;
 
     let img = ImageBuilder::default()
@@ -101,11 +104,16 @@ pub async fn qrcode(ctx: HttpContext) -> HttpResult {
 
     Ok(hyper::Response::builder()
         .header(httpserver::CONTENT_TYPE, "image/png")
-        .body(hyper::Body::from(img))?)
+        .body(Full::from(img).boxed())?)
+}
+
+#[cfg(not(feature = "fast_qr"))]
+pub async fn qrcode(_ctx: HttpContext) -> HttpResponse {
+    Resp::fail("function is not support")
 }
 
 /// 生成账号对应的密码
-pub async fn gen_pass(ctx: HttpContext) -> HttpResult {
+pub async fn gen_pass(ctx: HttpContext) -> HttpResponse {
     #[derive(Deserialize, Serialize)]
     struct Req {
         pass: CompactString,
@@ -113,7 +121,7 @@ pub async fn gen_pass(ctx: HttpContext) -> HttpResult {
 
     type Res = Req;
 
-    let param: Req = ctx.into_json().await?;
+    let param: Req = ctx.parse_json()?;
     let digest = md5_crypt::encrypt(&param.pass)?;
 
     Resp::ok(&Res {
