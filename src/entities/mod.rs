@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod sys_api;
 pub mod sys_config;
 pub mod sys_dict;
+pub mod sys_log;
 pub mod sys_menu;
 pub mod sys_permission;
 pub mod sys_role;
@@ -11,7 +12,7 @@ pub mod sys_user_state;
 
 #[derive(Serialize, Deserialize)]
 pub struct PageData<T> {
-    pub total: u32,
+    pub total: usize,
     pub list: Vec<T>,
 }
 
@@ -29,6 +30,20 @@ pub struct PageQuery<T> {
     pub i: u32,
     pub p: u32,
     pub a: Option<i32>,
+}
+
+#[allow(dead_code)]
+impl<T> PageData<T> {
+    pub fn new(total: usize, list: Vec<T>) -> Self {
+        Self { total, list }
+    }
+
+    pub fn with_list(list: Vec<T>) -> Self {
+        Self {
+            total: list.len(),
+            list,
+        }
+    }
 }
 
 impl PageInfo {

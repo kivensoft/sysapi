@@ -1,4 +1,6 @@
 //! 权限定义表
+use std::{collections::HashMap, hash::Hash};
+
 use super::{PageData, PageInfo};
 use crate::{
     entities::{
@@ -7,12 +9,16 @@ use crate::{
         sys_menu::SysMenu,
         sys_role::SysRole,
     },
-    utils::bits,
+    utils::{bits, consts},
 };
-use compact_str::format_compact;
-use gensql::{table, DbError, DbResult, Queryable, Transaction};
+use anyhow_ext::{bail, Result};
+use gensql::{db_log_params, db_log_sql, table, to_values, DbResult, Queryable, Transaction};
 use localtime::LocalTime;
-use std::{collections::HashMap, hash::Hash};
+
+pub const BUILTIN_ANONYMOUS_CODE: i16 = crate::auth::ANONYMOUS_CODE;
+pub const BUILTIN_ANONYMOUS_NAME: &str = "匿名许可";
+pub const BUILTIN_PUBLIC_CODE: i16 = crate::auth::PUBLIC_CODE;
+pub const BUILTIN_PUBLIC_NAME: &str = "公共许可";
 
 #[table("t_sys_permission")]
 pub struct SysPermission {
@@ -20,7 +26,7 @@ pub struct SysPermission {
     #[table(id)]
     permission_id: u32,
     /// 权限组代码
-    group_code: i16,
+    group_code: i8,
     /// 权限代码
     permission_code: i16,
     /// 权限名称
@@ -37,52 +43,97 @@ pub struct SysPermissionVo {
     group_name: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SysPermissionRearrange {
-    pub group_code: i16,
+    pub group_code: i8,
     pub permission_codes: Vec<i16>,
 }
 
 impl SysPermission {
+    pub async fn insert_with_notify(self) -> DbResult<(u32, u32)> {
+        let pid = self.permission_id;
+        let ret = self.insert().await;
+        if ret.is_ok() {
+            Self::notify_changed(pid).await;
+        }
+        ret
+    }
+
+    pub async fn update_with_notify(self) -> DbResult<bool> {
+        let pid = self.permission_id;
+        let ret = self.update_by_id().await;
+        if ret.is_ok() {
+            Self::notify_changed(pid).await;
+        }
+        ret
+    }
+
+    pub async fn delete_with_notify(id: u32) -> DbResult<bool> {
+        match Self::select_by_id(id).await? {
+            Some(record) => {
+                let pid = record.permission_id;
+                let ret = Self::delete_by_id(id).await;
+                if ret.is_ok() {
+                    Self::notify_changed(pid).await;
+                }
+                ret
+            }
+            None => Ok(false),
+        }
+    }
+
+    pub async fn notify_changed(id: Option<u32>) {
+        let id = match id {
+            Some(n) => format!("{n}"),
+            None => String::new(),
+        };
+        crate::services::gmc::get_cache().notify(consts::gmc::SYS_PERMISSION, &id).await
+    }
+
     /// 查询记录
-    pub async fn select_page( value: SysPermission, page: PageInfo) -> DbResult<PageData<SysPermissionVo>> {
+    pub async fn select_page(
+        value: SysPermission,
+        page: PageInfo,
+    ) -> DbResult<PageData<SysPermissionVo>> {
         type T = SysPermission;
         type D = SysDict;
-        const T: &str = "t";
-        const D: &str = "d";
+
+        let (t, d) = ("t", "d");
 
         let (tsql, psql, params) = gensql::SelectSql::new()
-            .select_columns_with_table(T, &T::FIELDS)
-            .select_as(D, D::DICT_NAME, SysPermissionVo::GROUP_NAME)
-            .from_alias(T::TABLE_NAME, T)
-            .left_join(D::TABLE_NAME, D, |j|
-                j.on_eq(D::DICT_CODE, T, T::GROUP_CODE)
+            .select_all_with_table(t)
+            .select_as(d, D::DICT_NAME, SysPermissionVo::GROUP_NAME)
+            .from_as(T::TABLE_NAME, t)
+            .left_join(D::TABLE_NAME, d, |j| {
+                j.on_eq(D::DICT_CODE, t, T::GROUP_CODE)
                     .on_eq_val(D::DICT_TYPE, DictType::PermissionGroup as u16)
-            )
-            .where_sql(|w|
-                w.eq_opt(T, T::GROUP_CODE, value.group_code)
-                    .like_opt(T, T::PERMISSION_NAME, value.permission_name)
-            )
-            .order_by_with_table(T, T::PERMISSION_CODE)
+            })
+            .where_sql(|w| {
+                w.eq_opt(t, T::GROUP_CODE, value.group_code).like_opt(
+                    t,
+                    T::PERMISSION_NAME,
+                    value.permission_name,
+                )
+            })
+            .order_by(t, T::PERMISSION_CODE)
             .build_with_page(page.index, page.size, page.total);
 
         let mut conn = gensql::get_conn().await?;
 
         let total = match page.total {
-            Some(n) => n,
-            None => conn.query_one(tsql, params.clone()).await?.unwrap_or(0)
+            Some(total) => total as usize,
+            None => conn.query_one(tsql, params.clone()).await?.unwrap_or(0),
         };
 
         let list = conn.query_fast(psql, params).await?;
-
         Ok(PageData { total, list })
     }
 
     /// 查询permission_code最大值
     pub async fn select_max_code() -> DbResult<Option<i16>> {
         let (sql, params) = gensql::SelectSql::new()
-            .select(&format_compact!("max({})", Self::PERMISSION_CODE))
+            .select("", &format!("max({})", Self::PERMISSION_CODE))
             .from(Self::TABLE_NAME)
             .build();
 
@@ -92,228 +143,319 @@ impl SysPermission {
     /// 加载所有记录
     pub async fn select_all() -> DbResult<Vec<SysPermission>> {
         let (psql, params) = gensql::SelectSql::new()
-            .select_columns(&Self::FIELDS)
             .from(Self::TABLE_NAME)
-            .order_by(Self::PERMISSION_CODE)
+            .order_by("", Self::PERMISSION_CODE)
             .build();
         gensql::sql_query_fast(psql, params).await
     }
 
-    pub async fn rearrange(value: &[SysPermissionRearrange]) -> DbResult<()> {
+    /// 对权限进行重新排序
+    pub async fn rearrange(value: &[SysPermissionRearrange]) -> Result<()> {
         // 从数据库中加载相关的权限组, 权限, 接口, 角色的记录集
-        let dict_list = SysDict::select_by_type(DictType::PermissionGroup as u16).await?;
+        let dict_list = SysDict::select_by_type(DictType::PermissionGroup as u8).await?;
         let permission_list = SysPermission::select_all().await?;
         let api_list = SysApi::select_all().await?;
-        let role_list = SysRole::select_all().await?;
         let menu_list = SysMenu::select_all().await?;
+        let role_list = SysRole::select_all().await?;
 
-        // 生成各种辅助数据结构用于加快排序速度
-        let dict_map = Self::slice_to_map(&dict_list, |v| v.dict_code.unwrap());
-        let permission_map = Self::slice_to_map(&permission_list, |v| v.permission_code.unwrap());
-        // 将所有api按权限code进行分组
-        let api_map = Self::slice_group(&api_list, |v| v.permission_code.unwrap());
-        // 将所有menu进行分组
-        let menu_map = Self::slice_group(&menu_list, |v| v.permission_code.unwrap());
+        // 生成hashmap用于加快查找速度
+        let dict_map = Self::slice_to_map(&dict_list, |v| {
+            v.dict_code.as_ref().map(|v| v.parse::<i8>().unwrap_or(-9))
+        })?;
+        let permission_map = Self::slice_to_map(&permission_list, |v| v.permission_code)?;
+        let api_map = Self::slice_group(&api_list, |v| v.permission_code)?;
+        let menu_map = Self::slice_group(&menu_list, |v| v.permission_code)?;
 
-        // 保存权限变化后的角色所对应的权限字符串
-        let mut role_permissions_list = vec![String::new(); role_list.len()];
         // 保存变动列表
-        let mut new_dict_list = Vec::with_capacity(dict_list.len());
-        let mut new_permission_list = Vec::with_capacity(permission_list.len());
-        let mut new_api_list = Vec::with_capacity(api_list.len());
-        let mut new_menu_list = Vec::with_capacity(menu_list.len());
+        let mut upd_dicts = Vec::with_capacity(dict_list.len());
+        let mut upd_permissions = Vec::with_capacity(permission_list.len());
+        let mut upd_apis = Vec::with_capacity(api_list.len());
+        let mut upd_menus = Vec::with_capacity(menu_list.len());
+        // 保存权限变化后的角色所对应的权限字符串
+        let mut upd_roles: Vec<_> = role_list
+            .iter()
+            .map(|v| (v.role_id.unwrap_or(0), String::with_capacity(64)))
+            .collect();
+        // 新的权限组、权限编码，在循环体中递增
+        let (mut new_group_code, mut new_permission_code): (i8, i16) = (0, 0);
 
-        // 更新数据用到的临时变量
-        let mut new_permission_code = 0;
+        // 生成待更新的权限组, 权限, api数据结构
+        for item in value.iter() {
+            // 找到权限组，并记录t_sys_dict待更新记录的内容
+            let dict = match dict_map.get(&item.group_code) {
+                Some(v) => *v,
+                None => bail!("权限组[code = {}]丢失", item.group_code),
+            };
+            if new_group_code != dict.dict_code.as_ref().unwrap().parse().unwrap_or(-9) {
+                upd_dicts.push((dict.dict_id.unwrap_or(0), new_group_code));
+            }
 
-        // 更新权限组, 权限, api
-        for (new_group_code, item) in value.iter().enumerate() {
-            let dict = *dict_map
-                .get(&item.group_code)
-                .ok_or_else(|| DbError::Other(format!("权限组[code = {}]丢失", item.group_code).into()))?;
-
-            // 记录字典表权限组的权限组代码变化
-            new_dict_list.push((dict.dict_id.unwrap(), new_group_code as i16));
-
+            // 分组下没有子权限，退出本次循环
             if item.permission_codes.is_empty() {
+                new_group_code += 1;
                 continue;
             }
 
             // 更新权限组所属的所有权限
-            for pcode in item.permission_codes.iter() {
-                let permission = *permission_map
-                    .get(pcode)
-                    .ok_or_else(|| DbError::Other(format!("权限[code = {pcode}]丢失").into()))?;
+            for permission_code in item.permission_codes.iter() {
+                let permission = match permission_map.get(permission_code) {
+                    Some(v) => v,
+                    None => bail!("权限[code = {}]丢失", permission_code),
+                };
 
                 // 更新权限的权限组代码及权限代码
-                new_permission_list.push((
-                    permission.permission_id.unwrap(),
-                    new_group_code as i16,
-                    new_permission_code as i16,
-                ));
+                if new_permission_code != permission.permission_code.unwrap_or(-9)
+                    || new_group_code != permission.group_code.unwrap_or(-9)
+                {
+                    upd_permissions.push((
+                        permission.permission_id.unwrap_or(0),
+                        new_group_code,
+                        new_permission_code,
+                    ));
+                }
 
                 // 更新角色的权限(旧的权限位置移动到新的位置)
-                for (role, role_p) in role_list.iter().zip(role_permissions_list.iter_mut()) {
-                    let rp = role.permissions.as_ref().unwrap();
-                    let bit = bits::get(rp, *pcode as usize);
-                    bits::set(role_p, new_permission_code, bit);
+                for (role, new_role) in role_list.iter().zip(upd_roles.iter_mut()) {
+                    if let Some(rp) = &role.permissions {
+                        if bits::get(rp, *permission_code as usize) {
+                            bits::set(&mut new_role.1, new_permission_code as usize, true);
+                        }
+                    }
                 }
 
                 // 更新权限关联的api
-                if let Some(sub_api_list) = api_map.get(pcode) {
-                    for item in sub_api_list.iter() {
-                        new_api_list.push((item.api_id.unwrap(), new_permission_code as i16));
+                if let Some(apis) = api_map.get(permission_code) {
+                    for item in apis.iter() {
+                        if new_permission_code != item.permission_code.unwrap_or(-9) {
+                            upd_apis.push((item.api_id.unwrap_or(0), new_permission_code));
+                        }
                     }
                 }
 
                 // 更新权限关联的菜单
-                if let Some(sub_menu_list) = menu_map.get(pcode) {
+                if let Some(sub_menu_list) = menu_map.get(permission_code) {
                     for item in sub_menu_list.iter() {
-                        new_menu_list.push((item.menu_id.unwrap(), new_permission_code as i16));
+                        if new_permission_code != item.permission_code.unwrap_or(-9) {
+                            upd_menus.push((item.menu_id.unwrap_or(0), new_permission_code));
+                        }
                     }
                 }
 
                 new_permission_code += 1;
             }
+            new_group_code += 1;
         }
 
-        // 获取数据库连接
+        // 判断角色权限，去除无需更新的角色记录
+        Self::retain_upd_roles(&role_list, &mut upd_roles);
+
+        // 使用事务模式进行多表更新
         let mut trans = gensql::start_transaction().await?;
 
-        Self::update_dicts(&mut trans, &new_dict_list).await?;
-        Self::update_permissions(&mut trans, &new_permission_list).await?;
-        Self::update_apis(&mut trans, &new_api_list).await?;
-        Self::update_menus(&mut trans, &new_menu_list).await?;
-        Self::update_roles(&mut trans, &role_list, role_permissions_list).await?;
-
+        Self::update_dicts(&mut trans, upd_dicts).await?;
+        Self::update_permissions(&mut trans, upd_permissions).await?;
+        Self::update_apis(&mut trans, upd_apis).await?;
+        Self::update_menus(&mut trans, upd_menus).await?;
+        Self::update_roles(&mut trans, upd_roles).await?;
         // 提交事务
         trans.commit().await?;
+        // 发送数据变更通知
+        SysDict::notify_changed(None).await;
+        Self::notify_changed(None).await;
+        SysApi::notify_changed(None).await;
+        SysMenu::notify_changed(None).await;
+        SysRole::notify_changed(None).await;
 
         Ok(())
     }
+}
 
-    fn slice_to_map<K, V, F>(slice: &[V], f: F) -> HashMap<K, &V>
-    where
-        K: Eq + Hash,
-        F: Fn(&V) -> K,
-    {
-        slice.iter().map(|v| (f(v), v)).collect()
+impl SysPermission {
+    /// 权限排序结果对字典项进行更新
+    async fn update_dicts(trans: &mut Transaction<'_>, list: Vec<(u32, i8)>) -> DbResult<()> {
+        if list.is_empty() {
+            return Ok(());
+        }
+
+        type T = SysDict;
+        let sql = format!(
+            "update {} set {} = ?, {} = now() where {} = ?",
+            T::TABLE_NAME,
+            T::DICT_CODE,
+            T::UPDATED_TIME,
+            T::DICT_ID
+        );
+        db_log_sql(&sql);
+
+        let iter = list
+            .into_iter()
+            .map(|v| to_values!(v.1, v.0))
+            .inspect(|v| db_log_params(v));
+
+        trans.exec_batch(sql, iter).await
     }
 
-    fn slice_group<K, V, F>(slice: &[V], f: F) -> HashMap<K, Vec<&V>>
+    /// 权限排序结果对权限进行更新
+    async fn update_permissions(
+        trans: &mut Transaction<'_>,
+        list: Vec<(u32, i8, i16)>,
+    ) -> DbResult<()> {
+        if list.is_empty() {
+            return Ok(());
+        }
+
+        let sql = format!(
+            "update {} set {} = ?, {} = ?, {} = now() where {} = ?",
+            SysPermission::TABLE_NAME,
+            SysPermission::GROUP_CODE,
+            SysPermission::PERMISSION_CODE,
+            SysPermission::UPDATED_TIME,
+            SysPermission::PERMISSION_ID
+        );
+        db_log_sql(&sql);
+
+        let iter = list
+            .into_iter()
+            .map(|v| to_values!(v.1, v.2, v.0))
+            .inspect(|v| db_log_params(v));
+
+        trans.exec_batch(sql, iter).await
+    }
+
+    /// 权限排序结果对接口信息进行更新
+    async fn update_apis(trans: &mut Transaction<'_>, list: Vec<(u32, i16)>) -> DbResult<()> {
+        if list.is_empty() {
+            return Ok(());
+        }
+
+        let sql = format!(
+            "update {} set {} = ?, {} = now() where {} = ?",
+            SysApi::TABLE_NAME,
+            SysApi::PERMISSION_CODE,
+            SysApi::UPDATED_TIME,
+            SysApi::API_ID,
+        );
+        db_log_sql(&sql);
+
+        let iter = list
+            .into_iter()
+            .map(|v| to_values!(v.1, v.0))
+            .inspect(|v| db_log_params(v));
+
+        trans.exec_batch(sql, iter).await
+    }
+
+    /// 权限排序结果对菜单进行更新
+    async fn update_menus(trans: &mut Transaction<'_>, list: Vec<(u32, i16)>) -> DbResult<()> {
+        if list.is_empty() {
+            return Ok(());
+        }
+
+        let sql = format!(
+            "update {} set {} = ?, {} = now() where {} = ?",
+            SysMenu::TABLE_NAME,
+            SysMenu::PERMISSION_CODE,
+            SysMenu::UPDATED_TIME,
+            SysMenu::MENU_ID,
+        );
+        db_log_sql(&sql);
+
+        let iter = list
+            .into_iter()
+            .map(|v| to_values!(v.1, v.0))
+            .inspect(|v| db_log_params(v));
+
+        trans.exec_batch(sql, iter).await
+    }
+
+    /// 权限排序结果对角色进行更新
+    async fn update_roles(trans: &mut Transaction<'_>, list: Vec<(u32, String)>) -> DbResult<()> {
+        if list.is_empty() {
+            return Ok(());
+        }
+
+        let sql = format!(
+            "update {} set {} = ?, {} = now() where {} = ?",
+            SysRole::TABLE_NAME,
+            SysRole::PERMISSIONS,
+            SysRole::UPDATED_TIME,
+            SysRole::ROLE_ID,
+        );
+        db_log_sql(&sql);
+
+        let iter = list
+            .into_iter()
+            .map(|v| to_values!(v.1, v.0))
+            .inspect(|v| db_log_params(v));
+
+        trans.exec_batch(sql, iter).await
+    }
+
+    // 判断角色权限，去除无需更新的角色记录
+    fn retain_upd_roles(old_roles: &[SysRole], upd_roles: &mut Vec<(u32, String)>) {
+        for (role, new_role) in old_roles.iter().zip(upd_roles.iter_mut()) {
+            // 忽略更新前后权限相同的记录
+            if let Some(permissions) = &role.permissions {
+                if permissions == &new_role.1 {
+                    new_role.1.clear()
+                }
+            } else {
+                // 删除尾部多余的0，长度为偶数
+                if new_role.1.len() % 2 != 0 {
+                    new_role.1.push('0');
+                }
+                while new_role.1.ends_with("00") {
+                    new_role.1.truncate(new_role.1.len() - 2);
+                }
+            }
+        }
+        upd_roles.retain(|s| !s.1.is_empty());
+    }
+
+    /// 数组转成hashmap，用于快速查找
+    fn slice_to_map<K, V, F>(slice: &[V], f: F) -> Result<HashMap<K, &V>>
     where
         K: Eq + Hash,
-        F: Fn(&V) -> K,
+        V: serde::Serialize,
+        F: Fn(&V) -> Option<K>,
+    {
+        let mut map = HashMap::with_capacity(slice.len());
+        for item in slice {
+            match f(item) {
+                Some(k) => {
+                    map.insert(k, item);
+                }
+                None => return Self::none_error(item),
+            }
+        }
+        Ok(map)
+    }
+
+    /// 数组转成hashmap，用于快速查找
+    fn slice_group<K, V, F>(slice: &[V], f: F) -> Result<HashMap<K, Vec<&V>>>
+    where
+        K: Eq + Hash,
+        V: serde::Serialize,
+        F: Fn(&V) -> Option<K>,
     {
         let mut map: HashMap<_, Vec<_>> = HashMap::new();
         for item in slice.iter() {
-            map.entry(f(item))
-                .and_modify(|v| v.push(item))
-                .or_insert_with(|| vec![item]);
+            match f(item) {
+                Some(k) => {
+                    map.entry(k)
+                        .and_modify(|v| v.push(item))
+                        .or_insert_with(|| vec![item]);
+                }
+                None => return Self::none_error(item),
+            }
         }
 
-        map
+        Ok(map)
     }
 
-    async fn update_dicts(trans: &mut Transaction<'_>, list: &[(u32, i16)]) -> DbResult<()> {
-        type D = SysDict;
-        let sql = format!(
-            "update {} set {} = ?, {} = ? where {} = ?",
-            D::TABLE_NAME,
-            D::DICT_CODE,
-            D::UPDATED_TIME,
-            D::DICT_ID
-        );
-        let now = LocalTime::now();
-
-        for item in list.iter() {
-            let params = gensql::to_values![item.1, now, item.0];
-            gensql::db_log_sql_params(&sql, &params);
-            trans.exec(&sql, params).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn update_permissions( trans: &mut Transaction<'_>, list: &[(u32, i16, i16)]) -> DbResult<()> {
-        type T = SysPermission;
-        let sql = format!(
-            "update {} set {} = ?, {} = ?, {} = ? where {} = ?",
-            T::TABLE_NAME,
-            T::GROUP_CODE,
-            T::PERMISSION_CODE,
-            T::UPDATED_TIME,
-            T::PERMISSION_ID
-        );
-        let now = LocalTime::now();
-
-        for item in list.iter() {
-            let params = gensql::to_values![item.1, item.2, now, item.0];
-            gensql::db_log_sql_params(&sql, &params);
-            trans.exec(&sql, params).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn update_apis(trans: &mut Transaction<'_>, list: &[(u32, i16)]) -> DbResult<()> {
-        type A = SysApi;
-        let sql = format!(
-            "update {} set {} = ?, {} = ? where {} = ?",
-            A::TABLE_NAME,
-            A::PERMISSION_CODE,
-            A::UPDATED_TIME,
-            A::API_ID
-        );
-        let now = LocalTime::now();
-
-        for item in list.iter() {
-            let params = gensql::to_values![item.1, now, item.0];
-            gensql::db_log_sql_params(&sql, &params);
-            trans.exec(&sql, params).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn update_menus(trans: &mut Transaction<'_>, list: &[(u32, i16)]) -> DbResult<()> {
-        type T = SysMenu;
-        let sql = format!(
-            "update {} set {} = ?, {} = ? where {} = ?",
-            T::TABLE_NAME,
-            T::PERMISSION_CODE,
-            T::UPDATED_TIME,
-            T::MENU_ID
-        );
-        let now = LocalTime::now();
-
-        for item in list.iter() {
-            let params = gensql::to_values![item.1, now, item.0];
-            gensql::db_log_sql_params(&sql, &params);
-            trans.exec(&sql, params).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn update_roles(trans: &mut Transaction<'_>, roles: &[SysRole], ps: Vec<String>) -> DbResult<()> {
-        type R = SysRole;
-        let sql = format!(
-            "update {} set {} = ?, {} = ? where {} = ?",
-            R::TABLE_NAME,
-            R::PERMISSIONS,
-            R::UPDATED_TIME,
-            R::ROLE_ID
-        );
-
-        let now = LocalTime::now();
-
-        for (role, p) in roles.iter().zip(ps.into_iter()) {
-            let params = gensql::to_values![p, now, role.role_id];
-            gensql::db_log_sql_params(&sql, &params);
-            trans.exec(&sql, params).await?;
-        }
-
-        Ok(())
+    /// 空值错误
+    fn none_error<T>(value: &impl serde::Serialize) -> Result<T> {
+        let msg = serde_json::to_string(value).unwrap();
+        bail!("错误，数据有空值: {}", msg)
     }
 }

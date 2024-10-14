@@ -2,11 +2,12 @@
 // author: kiven
 // slince 2023-09-20
 
+use std::borrow::Cow;
+
 use super::{ToValue, Value};
-use compact_str::CompactString;
 use itoa::Buffer;
-use rclite::Arc;
 use thiserror::Error;
+use utils::make_col_expr;
 
 const AND: &str = " and ";
 const OR: &str = " or ";
@@ -18,20 +19,28 @@ pub enum GenSqlError {
     UnsearchFrom,
 }
 
-enum InsertValue {
-    Sql(CompactString),
+pub enum InsertValue {
+    Sql(&'static str),
+    SqlString(String),
     Value(Value),
 }
 
 pub trait GeneratorSql {
     fn sql(&mut self) -> &mut Vec<u8>;
     fn params(&mut self) -> &mut Vec<Value>;
+    fn sql_params(&mut self) -> (&mut Vec<u8>, &mut Vec<Value>);
 }
 
 #[derive(Default)]
 struct BaseSql {
-    sql: Vec<u8>,
-    params: Vec<Value>,
+    pub(crate) sql: Vec<u8>,
+    pub(crate) params: Vec<Value>,
+}
+
+pub struct FieldInfo<'a> {
+    table: &'a str,
+    column: &'a str,
+    alias: &'a str,
 }
 
 pub struct SelectSql(BaseSql);
@@ -45,17 +54,26 @@ pub struct UpdateSql(BaseSql);
 
 pub struct DeleteSql(BaseSql);
 
+pub struct BatchInsertSql {
+    sql: Vec<u8>,
+    params: Vec<Vec<InsertValue>>,
+    #[cfg(debug_assertions)]
+    count: usize,
+}
+
+pub struct BatchDeleteSql(BaseSql);
+
 pub struct JoinSql {
     parent: SelectSql,
-    table: CompactString,
+    table: String,
 }
 
 pub struct TrimSql<T: GeneratorSql> {
-    pub(crate) parent: T,
-    pub(crate) prefix: Arc<CompactString>,
-    pub(crate) suffix: CompactString,
-    pub(crate) prefix_overrides: Vec<CompactString>,
-    pub(crate) suffix_overrides: Vec<CompactString>,
+    parent: T,
+    prefix: String,
+    suffix: String,
+    prefix_overrides: Vec<String>,
+    suffix_overrides: Vec<String>,
 }
 
 pub struct WhereSql<T: GeneratorSql>(TrimSql<T>);
@@ -69,12 +87,14 @@ enum LikeType {
 
 #[inline]
 pub fn db_log_sql(sql: &str) {
-    log::trace!("[SQL]: {}", sql);
+    log::debug!("[SQL]: {}", sql);
 }
 
 #[inline]
 pub fn db_log_params(params: &[Value]) {
-    log::trace!("[SQL-PARAMS]: {:?}", params);
+    if !params.is_empty() {
+        log::debug!("[SQL-PARAMS]: {:?}", params);
+    }
 }
 
 #[inline]
@@ -109,6 +129,11 @@ impl GeneratorSql for BaseSql {
     fn params(&mut self) -> &mut Vec<Value> {
         &mut self.params
     }
+
+    fn sql_params(&mut self) -> (&mut Vec<u8>, &mut Vec<Value>) {
+        (&mut self.sql, &mut self.params)
+    }
+
 }
 
 impl GeneratorSql for SelectSql {
@@ -119,6 +144,11 @@ impl GeneratorSql for SelectSql {
     fn params(&mut self) -> &mut Vec<Value> {
         &mut self.0.params
     }
+
+    fn sql_params(&mut self) -> (&mut Vec<u8>, &mut Vec<Value>) {
+        (&mut self.0.sql, &mut self.0.params)
+    }
+
 }
 
 impl GeneratorSql for DeleteSql {
@@ -129,6 +159,11 @@ impl GeneratorSql for DeleteSql {
     fn params(&mut self) -> &mut Vec<Value> {
         &mut self.0.params
     }
+
+    fn sql_params(&mut self) -> (&mut Vec<u8>, &mut Vec<Value>) {
+        (&mut self.0.sql, &mut self.0.params)
+    }
+
 }
 
 impl GeneratorSql for UpdateSql {
@@ -139,26 +174,11 @@ impl GeneratorSql for UpdateSql {
     fn params(&mut self) -> &mut Vec<Value> {
         &mut self.0.params
     }
-}
 
-impl<T: GeneratorSql> GeneratorSql for TrimSql<T> {
-    fn sql(&mut self) -> &mut Vec<u8> {
-        self.parent.sql()
+    fn sql_params(&mut self) -> (&mut Vec<u8>, &mut Vec<Value>) {
+        (&mut self.0.sql, &mut self.0.params)
     }
 
-    fn params(&mut self) -> &mut Vec<Value> {
-        self.parent.params()
-    }
-}
-
-impl<T: GeneratorSql> GeneratorSql for WhereSql<T> {
-    fn sql(&mut self) -> &mut Vec<u8> {
-        self.0.sql()
-    }
-
-    fn params(&mut self) -> &mut Vec<Value> {
-        self.0.params()
-    }
 }
 
 impl InsertSql {
@@ -201,11 +221,15 @@ impl InsertSql {
         self
     }
 
-    pub fn value_raw(mut self, col: &str, raw: &str) -> Self {
+    pub fn value_sql(mut self, col: &str, raw: Cow<'static, str>) -> Self {
         debug_assert!(!col.is_empty() && !raw.is_empty());
+        let v = match raw {
+            Cow::Borrowed(v) => InsertValue::Sql(v),
+            Cow::Owned(v) => InsertValue::SqlString(v),
+        };
         self.sql.extend_from_slice(col.as_bytes());
         self.sql.extend_from_slice(b", ");
-        self.params.push(InsertValue::Sql(CompactString::new(raw)));
+        self.params.push(v);
         self
     }
 
@@ -220,9 +244,10 @@ impl InsertSql {
         sql.extend_from_slice(b") values (");
         for param in self.params.into_iter() {
             match param {
-                InsertValue::Sql(s) => {
-                    sql.extend_from_slice(s.as_bytes());
-                }
+                InsertValue::Sql(s) =>
+                    sql.extend_from_slice(s.as_bytes()),
+                InsertValue::SqlString(s) =>
+                    sql.extend_from_slice(s.as_bytes()),
                 InsertValue::Value(v) => {
                     sql.push(b'?');
                     params.push(v);
@@ -253,56 +278,53 @@ impl SelectSql {
     }
 
     #[inline]
-    pub fn select(self, col: &str) -> Self {
-        self.select_as("", col, "")
-    }
-
-    #[inline]
-    pub fn select_with_table(self, table: &str, col: &str) -> Self {
+    pub fn select(self, table: &str, col: &str) -> Self {
         self.select_as(table, col, "")
     }
 
     pub fn select_as(mut self, table: &str, col: &str, alias: &str) -> Self {
         debug_assert!(!col.is_empty());
-        let sql = &mut self.0.sql;
-        push_col(sql, table, col);
-        if !alias.is_empty() {
-            sql.extend_from_slice(b" as ");
-            sql.extend_from_slice(alias.as_bytes());
-        }
-        sql.extend_from_slice(b", ");
+        utils::push_col_alias(&mut self.0.sql, table, col, alias);
         self
     }
 
-    #[inline]
-    pub fn select_columns(self, cols: &[&str]) -> Self {
-        self.select_columns_with_table("", cols)
-    }
-
-    pub fn select_columns_with_table(mut self, table: &str, cols: &[&str]) -> Self {
+    pub fn select_columns(mut self, table: &str, cols: &[&str]) -> Self {
         debug_assert!(!cols.is_empty() && cols.iter().find(|v| v.is_empty()).is_none());
         let sql = &mut self.0.sql;
         cols.iter().for_each(|col| {
-            push_col(sql, table, col);
-            sql.extend_from_slice(b", ");
+            utils::push_col_alias(sql, table, col, "");
         });
+        self
+    }
+
+    pub fn select_with_iter<'a, I>(mut self, iter: I) -> Self
+    where
+        I: IntoIterator<Item = FieldInfo<'a>>,
+    {
+        let sql = &mut self.0.sql;
+        for item in iter.into_iter() {
+            debug_assert!(!item.column.is_empty());
+            utils::push_col_alias(sql, item.table, item.column, item.alias);
+        }
         self
     }
 
     #[inline]
     pub fn from(self, table: &str) -> Self {
-        self.from_alias(table, "")
+        self.from_as(table, "")
     }
 
-    pub fn from_alias(mut self, table: &str, alias: &str) -> Self {
+    pub fn from_as(mut self, table: &str, alias: &str) -> Self {
         debug_assert!(!table.is_empty());
         let sql = &mut self.0.sql;
+
         // 删除select留下的多余分隔符
         if sql.ends_with(b", ") {
             sql.truncate(sql.len() - 2);
         } else {
             sql.push(b'*');
         }
+
         sql.extend_from_slice(b" from ");
         sql.extend_from_slice(table.as_bytes());
         if !alias.is_empty() {
@@ -349,66 +371,43 @@ impl SelectSql {
     }
 
     #[inline]
-    pub fn group_by(self, col: &str) -> Self {
-        self.group_by_columns_with_table("", std::slice::from_ref(&col))
+    pub fn group_by_(self, table: &str, col: &str) -> Self {
+        self.group_by_columns(table, std::slice::from_ref(&col))
     }
 
-    #[inline]
-    pub fn group_by_with_table(self, table: &str, col: &str) -> Self {
-        self.group_by_columns_with_table(table, std::slice::from_ref(&col))
-    }
-
-    #[inline]
-    pub fn group_by_columns(self, cols: &[&str]) -> Self {
-        self.group_by_columns_with_table("", cols)
-    }
-
-    pub fn group_by_columns_with_table(mut self, table: &str, cols: &[&str]) -> Self {
+    pub fn group_by_columns(mut self, table: &str, cols: &[&str]) -> Self {
         debug_assert!(!cols.is_empty() && cols.iter().find(|v| v.is_empty()).is_none());
         let sql = &mut self.0.sql;
         sql.extend_from_slice(b" group by ");
         for item in cols.iter() {
-            push_col(sql, table, item);
+            utils::push_col_alias(sql, table, item, "");
         }
+        sql.truncate(sql.len() - 2);
+        self
+    }
+
+    pub fn having(mut self, expr: &str) -> Self {
+        let sql = &mut self.0.sql;
+        sql.extend_from_slice(b" having ");
+        sql.extend_from_slice(expr.as_bytes());
         self
     }
 
     #[inline]
-    pub fn order_by(self, col: &str) -> Self {
-        self.order_by_columns_with_table("", std::slice::from_ref(&col))
+    pub fn order_by(self, table: &str, col: &str) -> Self {
+        self.order_by_columns(table, std::slice::from_ref(&col))
     }
 
-    #[inline]
-    pub fn order_by_with_table(self, table: &str, col: &str) -> Self {
-        self.order_by_columns_with_table(table, std::slice::from_ref(&col))
-    }
-
-    #[inline]
-    pub fn order_by_columns(self, cols: &[&str]) -> Self {
-        self.order_by_columns_with_table("", cols)
-    }
-
-    pub fn order_by_columns_with_table(mut self, table: &str, cols: &[&str]) -> Self {
-        debug_assert!(!cols.is_empty() && cols.iter().find(|v| v.is_empty()).is_none());
-        let sql = &mut self.0.sql;
-        sql.extend_from_slice(b" order by ");
-        for item in cols.iter() {
-            push_col(sql, table, item);
-        }
+    pub fn order_by_columns(mut self, table: &str, cols: &[&str]) -> Self {
+        utils::order_by_iter(&mut self.0.sql, &mut cols.iter().map(|v| (table, *v, false)));
         self
     }
 
-    #[inline]
-    pub fn order_by_desc(self, col: &str) -> Self {
-        self.order_by_with_table_desc("", col)
-    }
-
-    pub fn order_by_with_table_desc(mut self, table: &str, col: &str) -> Self {
-        debug_assert!(!col.is_empty());
-        let sql = &mut self.0.sql;
-        sql.extend_from_slice(b" order by ");
-        push_col(sql, table, col);
-        sql.extend_from_slice(b" desc");
+    pub fn order_by_with_iter<'a, I>(mut self, iter: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a str, bool)>,
+    {
+        utils::order_by_iter(&mut self.0.sql, &mut iter.into_iter());
         self
     }
 
@@ -417,6 +416,41 @@ impl SelectSql {
             Self::set_limits(&mut self.0.sql, offset, count);
         }
         self
+    }
+
+    #[inline]
+    pub fn add_sql(mut self, sql: &str) -> Self {
+        self.0.sql.extend_from_slice(sql.as_bytes());
+        self
+    }
+
+    #[inline]
+    pub fn add_sql_if(self, cond: bool, sql: &str) -> Self {
+        if cond { self.add_sql(sql) } else { self }
+    }
+
+    #[inline]
+    pub fn add_sql_val_if<T: ToValue>(self, cond: bool, sql: &str, val: T) -> Self {
+        if cond { self.add_sql_val(sql, val) } else { self }
+    }
+
+    #[inline]
+    pub fn add_sql_val<T: ToValue>(mut self, sql: &str, val: T) -> Self {
+        self.0.params.push(val.to_value());
+        self.add_sql(sql)
+    }
+
+    #[inline]
+    pub fn add_sql_vals_if<I: IntoIterator<Item = V>, V: ToValue>(
+        self, cond: bool, sql: &str, iter: I) -> Self
+    {
+        if cond { self.add_sql_vals(sql, iter) } else { self }
+    }
+
+    #[inline]
+    pub fn add_sql_vals<I: IntoIterator<Item = V>, V: ToValue>(mut self, sql: &str, iter: I) -> Self {
+        self.0.params.extend(iter.into_iter().map(|v| v.to_value()));
+        self.add_sql(sql)
     }
 
     pub fn build(self) -> (String, Vec<Value>) {
@@ -498,7 +532,7 @@ impl UpdateSql {
         self
     }
 
-    pub fn set_raw(mut self, col: &str, raw: &str) -> Self {
+    pub fn set_sql(mut self, col: &str, raw: &str) -> Self {
         let sql = &mut self.0.sql;
         sql.extend_from_slice(col.as_bytes());
         sql.extend_from_slice(b" = ");
@@ -555,6 +589,123 @@ impl DeleteSql {
     }
 }
 
+impl BatchInsertSql {
+    pub fn new(table: &str, cols: &[&str]) -> Self {
+        #[cfg(debug_assertions)]
+        debug_assert!(!table.is_empty());
+        #[cfg(debug_assertions)]
+        let mut result = Self {
+            sql: Vec::new(),
+            params: Vec::new(),
+            count: cols.len(),
+        };
+        #[cfg(not(debug_assertions))]
+        let mut result = Self {
+            sql: Vec::new(),
+            params: Vec::new(),
+        };
+        let sql = &mut result.sql;
+        sql.extend_from_slice(b"insert into ");
+        sql.extend_from_slice(table.as_bytes());
+        sql.push(b' ');
+        sql.push(b'(');
+        for col in cols {
+            debug_assert!(!col.is_empty());
+            sql.extend_from_slice(col.as_bytes());
+            sql.push(b',');
+            sql.push(b' ');
+        }
+        sql.truncate(sql.len() - 2);
+        sql.extend_from_slice(b") values ");
+
+        result
+    }
+
+    pub fn value(mut self, val: Vec<InsertValue>) -> Self {
+        #[cfg(debug_assertions)]
+        debug_assert!(self.count == val.len());
+        self.params.push(val);
+        self
+    }
+
+    pub fn values<I>(mut self, i: I) -> Self
+    where
+        I: IntoIterator<Item = Vec<InsertValue>>,
+    {
+        for item in i.into_iter() {
+            #[cfg(debug_assertions)]
+            debug_assert!(self.count == item.len());
+            self.params.push(item);
+        }
+        self
+    }
+
+    pub fn build(self) -> (String, Vec<Value>) {
+        debug_assert!(!self.params.is_empty());
+
+        let mut sql = self.sql;
+        let mut params = Vec::new();
+
+        for ps in self.params.into_iter() {
+            sql.push(b'(');
+            for param in ps.into_iter() {
+                match param {
+                    InsertValue::Sql(s) =>
+                        sql.extend_from_slice(s.as_bytes()),
+                    InsertValue::SqlString(s) =>
+                        sql.extend_from_slice(s.as_bytes()),
+                    InsertValue::Value(v) => {
+                        sql.push(b'?');
+                        params.push(v);
+                    }
+                }
+                sql.extend_from_slice(b", ")
+            }
+            sql.truncate(sql.len() - 2);
+            sql.extend_from_slice(b"), ");
+        }
+        sql.truncate(sql.len() - 2);
+
+        let sql = unsafe { String::from_utf8_unchecked(sql) };
+        db_log_sql_params(&sql, &params);
+        (sql, params)
+    }
+}
+
+impl BatchDeleteSql {
+    pub fn new<V, I>(table: &str, col: &str, i: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: ToValue,
+    {
+        debug_assert!(!table.is_empty());
+        debug_assert!(!col.is_empty());
+
+        let (mut sql, mut params) = (Vec::new(), Vec::new());
+
+        sql.extend_from_slice(b"delete from ");
+        sql.extend_from_slice(table.as_bytes());
+        sql.extend_from_slice(b" where ");
+        sql.extend_from_slice(col.as_bytes());
+        sql.extend_from_slice(b" in (");
+
+        for val in i.into_iter() {
+            sql.extend_from_slice(b"?, ");
+            params.push(val.to_value());
+        }
+        sql.truncate(sql.len() - 2);
+        sql.push(b')');
+
+        Self(BaseSql{sql, params})
+    }
+
+    pub fn build(self) -> (String, Vec<Value>) {
+        let sql = unsafe { String::from_utf8_unchecked(self.0.sql) };
+        db_log_sql_params(&sql, &self.0.params);
+        (sql, self.0.params)
+    }
+}
+
 impl JoinSql {
     pub(crate) fn new(mut parent: SelectSql, join_type: &str, table: &str, alias: &str) -> Self {
         debug_assert!(!table.is_empty());
@@ -570,8 +721,7 @@ impl JoinSql {
 
         sql.extend_from_slice(ON.as_bytes());
 
-        let table = CompactString::new(if !alias.is_empty() { alias } else { table });
-
+        let table = String::from(if !alias.is_empty() { alias } else { table });
         Self { parent, table }
     }
 
@@ -582,38 +732,20 @@ impl JoinSql {
 
     #[inline]
     pub fn on(mut self, expr: &str) -> Self {
-        debug_assert!(!expr.is_empty());
-        let sql = &mut self.parent.0.sql;
-        Self::on_raw(sql, expr);
+        Self::on_raw(&mut self.parent.0.sql, expr);
         self
     }
 
     pub fn on_eq(mut self, self_col: &str, other_table: &str, other_col: &str) -> Self {
         debug_assert!(!self_col.is_empty() && !other_table.is_empty() && !other_col.is_empty());
-        let sql = &mut self.parent.0.sql;
-        Self::on_raw(sql, &self.table);
-        sql.push(b'.');
-        sql.extend_from_slice(self_col.as_bytes());
-        sql.extend_from_slice(b" = ");
-        sql.extend_from_slice(other_table.as_bytes());
-        sql.push(b'.');
-        sql.extend_from_slice(other_col.as_bytes());
-
+        utils::join_on(&mut self.parent.0.sql, &self.table, self_col, " = ", other_table, other_col);
         self
     }
 
     pub fn on_val<T: ToValue>(mut self, self_col: &str, expr: &str, val: T) -> Self {
         debug_assert!(!self_col.is_empty() && !expr.is_empty());
         self.parent.0.params.push(val.to_value());
-
-        let sql = &mut self.parent.0.sql;
-        Self::on_raw(sql, &self.table);
-        sql.push(b'.');
-        sql.extend_from_slice(self_col.as_bytes());
-        sql.push(b' ');
-        sql.extend_from_slice(expr.as_bytes());
-        sql.extend_from_slice(b" ?");
-
+        utils::join_on(&mut self.parent.0.sql, &self.table, self_col, expr, "", "?");
         self
     }
 
@@ -632,7 +764,10 @@ impl JoinSql {
 
     #[inline]
     pub fn on_eq_val_opt<T: ToValue>(self, col: &str, val: Option<T>) -> Self {
-        self.on_val_opt(col, "=", val)
+        match val {
+            Some(val) => self.on_val(col, "=", val),
+            None => self,
+        }
     }
 
     #[inline]
@@ -646,49 +781,37 @@ impl JoinSql {
     }
 
     fn on_raw(sql: &mut Vec<u8>, raw: &str) {
-        if !sql.ends_with(ON.as_bytes()) {
-            sql.extend_from_slice(AND.as_bytes());
-        }
+        debug_assert!(!raw.is_empty());
+        utils::replace_prefix(sql, ON, AND);
         sql.extend_from_slice(raw.as_bytes());
     }
 
 }
 
 impl TrimSql<BaseSql> {
-    pub fn new(
-        prefix: &str,
-        suffix: &str,
-        prefix_overrides: &[&str],
-        suffix_overrides: &[&str],
-    ) -> Self {
-        Self::with_parent(
-            BaseSql::default(),
-            prefix,
-            suffix,
-            prefix_overrides,
-            suffix_overrides,
-        )
+    #[inline]
+    pub fn new(prefix: &str, suffix: &str, prefix_overrides: &[&str], suffix_overrides: &[&str]) -> Self {
+        Self::with_parent(BaseSql::default(), prefix, suffix, prefix_overrides, suffix_overrides)
+    }
+
+    #[inline]
+    pub fn to_sql_params(self) -> (String, Vec<Value>) {
+        let b = self.end_trim();
+        let sql = unsafe { String::from_utf8_unchecked(b.sql) };
+        (sql, b.params)
     }
 }
 
 impl<T: GeneratorSql> TrimSql<T> {
-    pub(crate) fn with_parent(
+    fn with_parent(
         mut parent: T,
         prefix: &str,
         suffix: &str,
         prefix_overrides: &[&str],
         suffix_overrides: &[&str],
     ) -> Self {
-        debug_assert!(
-            prefix.is_empty()
-                || prefix.as_bytes()[0] == b' ' && prefix.as_bytes()[prefix.len() - 1] == b' '
-        );
-        debug_assert!(
-            prefix_overrides.is_empty() || prefix_overrides.iter().find(|s| s.is_empty()).is_none()
-        );
-        debug_assert!(
-            suffix_overrides.is_empty() || suffix_overrides.iter().find(|s| s.is_empty()).is_none()
-        );
+        debug_assert!(prefix_overrides.iter().find(|s| s.is_empty()).is_none());
+        debug_assert!( suffix_overrides.iter().find(|s| s.is_empty()).is_none());
 
         let psql = parent.sql();
 
@@ -696,26 +819,20 @@ impl<T: GeneratorSql> TrimSql<T> {
             psql.extend_from_slice(prefix.as_bytes());
         }
 
-        let prefix_overrides = prefix_overrides
-            .iter()
-            .map(|s| CompactString::new(s))
-            .collect();
-        let suffix_overrides = suffix_overrides
-            .iter()
-            .map(|s| CompactString::new(s))
-            .collect();
+        let prefix_overrides = prefix_overrides.iter().map(|s| String::from(*s)).collect();
+        let suffix_overrides = suffix_overrides.iter().map(|s| String::from(*s)).collect();
 
         Self {
             parent,
-            prefix: Arc::new(CompactString::new(prefix)),
-            suffix: CompactString::new(suffix),
+            prefix: String::from(prefix),
+            suffix: String::from(suffix),
             prefix_overrides,
             suffix_overrides,
         }
     }
 
     /// 在语句结尾的时候，进行截断
-    pub(crate) fn end_trim(mut self) -> T {
+    fn end_trim(mut self) -> T {
         let psql = self.parent.sql();
 
         // 语句为空
@@ -723,14 +840,16 @@ impl<T: GeneratorSql> TrimSql<T> {
             psql.truncate(psql.len() - self.prefix.len());
         } else {
             // 去除后缀多余的字符
-            for item in self.suffix_overrides {
+            for item in &self.suffix_overrides {
                 if psql.ends_with(item.as_bytes()) {
                     psql.truncate(psql.len() - item.len());
                     break;
                 }
             }
             // 添加后缀
-            psql.extend_from_slice(self.suffix.as_bytes());
+            if !self.suffix.is_empty() {
+                psql.extend_from_slice(self.suffix.as_bytes());
+            }
         }
 
         self.parent
@@ -743,6 +862,18 @@ impl<T: GeneratorSql> TrimSql<T> {
     }
 
     #[inline]
+    pub fn add_sql_if(mut self, cond: bool, sql: &str) -> Self {
+        if cond { self.inner_add_sql(sql); }
+        self
+    }
+
+    #[inline]
+    pub fn add_sql_if_cb<'a, F: Fn() -> Cow<'a, str>>(mut self, cond: bool, f: F) -> Self {
+        if cond { self.inner_add_sql(&f()); }
+        self
+    }
+
+    #[inline]
     pub fn add_value<V: ToValue>(mut self, sql: &str, val: V) -> Self {
         self.inner_add_sql(sql);
         self.parent.params().push(val.to_value());
@@ -750,24 +881,9 @@ impl<T: GeneratorSql> TrimSql<T> {
     }
 
     #[inline]
-    pub fn add_values<V: ToValue>(mut self, sql: &str, vals: Vec<V>) -> Self {
-        self.inner_add_values(sql, vals);
-        self
-    }
-
-    #[inline]
-    pub fn if_add_value<V: ToValue>(mut self, cond: bool, sql: &str, val: V) -> Self {
+    pub fn add_value_if<V: ToValue>(self, cond: bool, sql: &str, val: V) -> Self {
         if cond {
-            self.inner_add_sql(sql);
-            self.parent.params().push(val.to_value());
-        }
-        self
-    }
-
-    #[inline]
-    pub fn if_add_values<V: ToValue>(self, cond: bool, sql: &str, vals: Vec<V>) -> Self {
-        if cond {
-            self.add_values(sql, vals)
+            self.add_value(sql, val)
         } else {
             self
         }
@@ -792,114 +908,105 @@ impl<T: GeneratorSql> TrimSql<T> {
     }
 
     #[inline]
-    pub fn for_each<V: ToValue>(
-        mut self,
-        open: &str,
-        close: &str,
-        sep: &str,
-        list: Vec<V>,
-    ) -> Self {
-        self.inner_for_each(open, close, sep, list);
+    pub fn add_values<I, V>(mut self, sql: &str, iter: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: ToValue,
+    {
+        self.inner_add_values(sql, iter);
         self
     }
 
-    pub(crate) fn inner_add_sql(&mut self, sql: &str) {
-        let psql = self.parent.sql();
-        let mut sql = sql.as_bytes();
-        let start_space = sql[0] == b' ';
-
-        if !self.prefix.is_empty() && psql.ends_with(self.prefix.as_bytes()) {
-            for mut item in self.prefix_overrides.iter().map(|s| s.as_bytes()) {
-                if !start_space {
-                    item = &item[1..];
-                }
-                if sql.starts_with(item) {
-                    sql = &sql[item.len()..];
-                    break;
-                }
-            }
+    #[inline]
+    pub fn add_values_if<I, V>(self, cond: bool, sql: &str, iter: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: ToValue,
+    {
+        if cond {
+            self.add_values(sql, iter)
+        } else {
+            self
         }
-
-        if !start_space {
-            psql.push(b' ');
-        }
-        psql.extend_from_slice(sql);
     }
 
-    pub(crate) fn inner_add_values<V: ToValue>(&mut self, sql: &str, vals: Vec<V>) {
-        if !vals.is_empty() {
+    #[inline]
+    pub fn for_each<I, V>(mut self, prefix: &str, open: &str, close: &str, sep: &str, iter: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: ToValue,
+    {
+        self.inner_for_each(prefix, open, close, sep, iter);
+        self
+    }
+
+    #[inline]
+    fn inner_add_sql(&mut self, sql: &str) {
+        utils::trim_add_sql(self.parent.sql(), self.prefix.as_str(), &self.prefix_overrides, sql)
+    }
+
+    #[inline]
+    fn inner_add_values<I, V>(&mut self, sql: &str, iter: I)
+    where
+        I: IntoIterator<Item = V>,
+        V: ToValue,
+    {
+        if utils::trim_add_values(self.parent.params(), iter) > 0 {
             self.inner_add_sql(sql);
-
-            let params = self.parent.params();
-            for item in vals.into_iter() {
-                params.push(item.to_value());
-            }
         }
     }
 
-    pub(crate) fn inner_for_each<V: ToValue>(
-        &mut self,
-        open: &str,
-        close: &str,
-        sep: &str,
-        list: Vec<V>,
-    ) {
-        if !list.is_empty() {
-            if !open.is_empty() {
-                self.inner_add_sql(open);
-            }
-
-            let psql = self.parent.sql();
-
-            for _ in 0..list.len() {
-                psql.push(b'?');
-                if !sep.is_empty() {
-                    psql.extend_from_slice(sep.as_bytes())
-                }
-            }
-            if !sep.is_empty() {
-                psql.truncate(psql.len() - sep.len());
-            }
-
-            if !close.is_empty() {
-                psql.extend_from_slice(close.as_bytes());
-            }
-
-            let params = self.parent.params();
-
-            for item in list.into_iter() {
-                params.push(item.to_value());
-            }
-        }
+    #[inline]
+    fn inner_for_each<I, V>(&mut self, prefix: &str, open: &str, close: &str, sep: &str, iter: I)
+    where
+        I: IntoIterator<Item = V>,
+        V: ToValue,
+    {
+        utils::make_for_each(self.parent.sql_params(), &self.prefix,
+            &self.prefix_overrides, prefix, open, close, sep,
+            &mut iter.into_iter().map(|v| v.to_value()));
     }
+
 }
 
 impl WhereSql<BaseSql> {
+    #[inline]
     pub fn new() -> Self {
         Self::with_parent(BaseSql::default())
     }
 
+    #[inline]
     pub fn to_sql_params(self) -> (String, Vec<Value>) {
-        let b = self.0.end_trim();
-        let sql = unsafe { String::from_utf8_unchecked(b.sql) };
-        (sql, b.params)
+        self.0.to_sql_params()
     }
 }
 
 impl<T: GeneratorSql> WhereSql<T> {
     #[inline]
-    pub(crate) fn with_parent(parent: T) -> Self {
+    fn with_parent(parent: T) -> Self {
         Self(TrimSql::with_parent(parent, " where ", "", &[AND, OR], &[]))
     }
 
     #[inline]
-    pub(crate) fn end_where(self) -> T {
+    fn end_where(self) -> T {
         self.0.end_trim()
     }
 
     #[inline]
     pub fn add_sql(mut self, sql: &str) -> Self {
         self.0.inner_add_sql(sql);
+        self
+    }
+
+    #[inline]
+    pub fn add_sql_if(mut self, cond: bool, sql: &str) -> Self {
+        if cond { self.0.inner_add_sql(sql); }
+        self
+    }
+
+    #[inline]
+    pub fn add_sql_if_cb<'a, F: Fn() -> Cow<'a, str>>(mut self, cond: bool, f: F) -> Self {
+        if cond { self.0.inner_add_sql(&f()); }
         self
     }
 
@@ -925,12 +1032,19 @@ impl<T: GeneratorSql> WhereSql<T> {
     /// * `val`: 动态参数
     ///
     #[inline]
-    pub fn if_add_value<V: ToValue>(mut self, cond: bool, sql: &str, val: V) -> Self {
+    pub fn add_value_if<V: ToValue>(self, cond: bool, sql: &str, val: V) -> Self {
         if cond {
-            self.0.inner_add_sql(sql);
-            self.0.parent.params().push(val.to_value());
+            self.add_value(sql, val)
+        } else {
+            self
         }
-        self
+    }
+
+    #[inline]
+    pub fn add_value_if_cb<'a, V: ToValue, F: Fn() -> Cow<'a, str>>(
+        self, cond: bool, val: V, f: F) -> Self
+    {
+        if cond { self.add_value(&f(), val) } else { self }
     }
 
     /// 当`val`不为`None`时添加查询条件，使用原始的sql语句
@@ -973,8 +1087,12 @@ impl<T: GeneratorSql> WhereSql<T> {
     /// * `vals`: 动态参数列表
     ///
     #[inline]
-    pub fn add_values<V: ToValue>(mut self, sql: &str, vals: Vec<V>) -> Self {
-        self.0.inner_add_values(sql, vals);
+    pub fn add_values<I, V>(mut self, sql: &str, iter: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: ToValue,
+    {
+        self.0.inner_add_values(sql, iter);
         self
     }
 
@@ -986,10 +1104,12 @@ impl<T: GeneratorSql> WhereSql<T> {
     /// * `val`: 动态参数
     ///
     #[inline]
-    pub fn if_add_values<V: ToValue>(mut self, cond: bool, sql: &str, vals: Vec<V>) -> Self {
-        if cond {
-            self.0.inner_add_values(sql, vals);
-        }
+    pub fn add_values_if<I, V>(mut self, cond: bool, sql: &str, iter: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: ToValue,
+    {
+        if cond { self.0.inner_add_values(sql, iter); }
         self
     }
 
@@ -1004,14 +1124,12 @@ impl<T: GeneratorSql> WhereSql<T> {
     /// * `val`: 列表参数
     ///
     #[inline]
-    pub fn for_each<V: ToValue>(
-        mut self,
-        open: &str,
-        close: &str,
-        sep: &str,
-        vals: Vec<V>,
-    ) -> Self {
-        self.0.inner_for_each(open, close, sep, vals);
+    pub fn for_each<I, V>(mut self, prefix: &str, open: &str, close: &str, sep: &str, iter: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: ToValue,
+    {
+        self.0.inner_for_each(prefix, open, close, sep, iter);
         self
     }
 
@@ -1025,10 +1143,45 @@ impl<T: GeneratorSql> WhereSql<T> {
     /// * `val`: 要比较的值，实现`ToValue`特征的泛型类型
     ///
     #[inline]
-    pub fn cmp<V: ToValue>(mut self, table: &str, col: &str, expr: &str, val: V) -> Self {
-        debug_assert!(!expr.is_empty());
-        self.inner_expr(AND, table, col, expr, val);
+    pub fn expr<V: ToValue>(mut self, table: &str, col: &str, expr: &str, val: V) -> Self {
+        utils::where_expr(self.0.parent.sql_params(), &self.0.prefix, AND, table, col, expr, val);
         self
+    }
+
+    /// 添加比较条件，将字段值与传入参数`val`使用指定表达式`expr`进行比较。
+    ///
+    /// Arguments:
+    ///
+    /// * `pred`: 判断是否添加条件的值
+    /// * `table`: 表名或表别名
+    /// * `col`: 字段名
+    /// * `expr`: 比较表达式，类似于“=”、“!=”、“">”、“<”、“">=”、“<=”等
+    /// * `val`: 要比较的值，实现`ToValue`特征的泛型类型
+    ///
+    #[inline]
+    pub fn expr_if<V: ToValue>(self, pred: bool, table: &str, col: &str, expr: &str, val: V) -> Self {
+        if pred {
+            self.expr(table, col, expr, val)
+        } else {
+            self
+        }
+    }
+
+    /// 添加比较条件，将字段值与传入参数`val`使用指定表达式`expr`进行比较。
+    ///
+    /// Arguments:
+    ///
+    /// * `table`: 表名或表别名
+    /// * `col`: 字段名
+    /// * `expr`: 比较表达式，类似于“=”、“!=”、“">”、“<”、“">=”、“<=”等
+    /// * `val`: 要比较的值，实现`ToValue`特征的泛型类型
+    ///
+    #[inline]
+    pub fn expr_opt<V: ToValue>(self, table: &str, col: &str, expr: &str, val: Option<V>) -> Self {
+        match val {
+            Some(val) => self.expr(table, col, expr, val),
+            None => self,
+        }
     }
 
     /// 添加相等比较条件，将字段值与传入参数`val`进行比较。
@@ -1041,7 +1194,7 @@ impl<T: GeneratorSql> WhereSql<T> {
     ///
     #[inline]
     pub fn eq<V: ToValue>(mut self, table: &str, col: &str, val: V) -> Self {
-        self.inner_expr(AND, table, col, "=", val);
+        utils::where_expr(self.0.parent.sql_params(), &self.0.prefix, AND, table, col, "=", val);
         self
     }
 
@@ -1107,7 +1260,8 @@ impl<T: GeneratorSql> WhereSql<T> {
     ///
     #[inline]
     pub fn like(mut self, table: &str, col: &str, val: &str) -> Self {
-        self.inner_like(AND, table, col, LikeType::Full, val);
+        utils::where_like(self.0.parent.sql_params(), &self.0.prefix,
+            AND, table, col, LikeType::Full, val);
         self
     }
 
@@ -1137,7 +1291,8 @@ impl<T: GeneratorSql> WhereSql<T> {
     ///
     #[inline]
     pub fn like_right(mut self, table: &str, col: &str, val: &str) -> Self {
-        self.inner_like(AND, table, col, LikeType::Right, val);
+        utils::where_like(self.0.parent.sql_params(), &self.0.prefix,
+            AND, table, col, LikeType::Right, val);
         self
     }
 
@@ -1157,34 +1312,6 @@ impl<T: GeneratorSql> WhereSql<T> {
         }
     }
 
-    /// 添加between比较条件，between是闭区间条件，即`v1 <= col <= v2`
-    ///
-    /// Arguments:
-    ///
-    /// * `table`: 表名或表别名
-    /// * `col`: 字段名
-    /// * `v1`: 起始值，必须满足 v1 <= v2
-    /// * `v2`: 结束值
-    ///
-    pub fn between<V: ToValue>(mut self, table: &str, col: &str, v1: V, v2: V) -> Self {
-        let prefix = self.0.prefix.clone();
-        let psql = self.0.sql();
-
-        if !psql.ends_with(prefix.as_bytes()) {
-            psql.extend_from_slice(AND.as_bytes());
-        }
-
-        push_col(psql, table, col);
-
-        psql.extend_from_slice(b" between ? and ?");
-
-        let params = self.0.params();
-        params.push(v1.to_value());
-        params.push(v2.to_value());
-
-        self
-    }
-
     /// 当`v1`和`v2`不为`None`且不为空字符串时添加between比较条件，between是闭区间条件，即`v1 <= col <= v2`
     ///
     /// Arguments:
@@ -1195,13 +1322,7 @@ impl<T: GeneratorSql> WhereSql<T> {
     /// * `v2`: 结束值
     ///
     #[inline]
-    pub fn between_opt<V: ToValue>(
-        self,
-        table: &str,
-        col: &str,
-        v1: Option<V>,
-        v2: Option<V>,
-    ) -> Self {
+    pub fn between_opt<V: ToValue>(self, table: &str, col: &str, v1: Option<V>, v2: Option<V>) -> Self {
         if let (Some(v1), Some(v2)) = (v1, v2) {
             self.between(table, col, v1, v2)
         } else {
@@ -1209,7 +1330,7 @@ impl<T: GeneratorSql> WhereSql<T> {
         }
     }
 
-    /// 添加in条件，类似生成
+    /// 添加between比较条件，between是闭区间条件，即`v1 <= col <= v2`
     ///
     /// Arguments:
     ///
@@ -1218,29 +1339,17 @@ impl<T: GeneratorSql> WhereSql<T> {
     /// * `v1`: 起始值，必须满足 v1 <= v2
     /// * `v2`: 结束值
     ///
-    pub fn in_<V: ToValue>(mut self, table: &str, col: &str, vals: Vec<V>) -> Self {
-        if !vals.is_empty() {
-            let prefix = self.0.prefix.clone();
-            let psql = self.0.sql();
+    pub fn between<V: ToValue>(mut self, table: &str, col: &str, v1: V, v2: V) -> Self {
+        let psql = self.0.parent.sql();
 
-            if !psql.ends_with(prefix.as_bytes()) {
-                psql.extend_from_slice(AND.as_bytes());
-            }
+        utils::replace_prefix(psql, &self.0.prefix, AND);
+        utils::push_col(psql, table, col);
 
-            push_col(psql, table, col);
+        psql.extend_from_slice(b" between ? and ?");
 
-            psql.extend_from_slice(b" in (");
-            for _ in 0..vals.len() {
-                psql.extend_from_slice(b"?, ");
-            }
-            psql.truncate(psql.len() - 2);
-            psql.push(b')');
-
-            let params = self.0.params();
-            for val in vals {
-                params.push(val.to_value());
-            }
-        }
+        let params = self.0.parent.params();
+        params.push(v1.to_value());
+        params.push(v2.to_value());
 
         self
     }
@@ -1262,27 +1371,159 @@ impl<T: GeneratorSql> WhereSql<T> {
         }
     }
 
-    fn inner_expr<V: ToValue>(&mut self, opera: &str, table: &str, col: &str, expr: &str, val: V) {
-        debug_assert!(!col.is_empty());
-
-        let prefix = self.0.prefix.clone();
-        let psql = self.0.sql();
-
-        if !psql.ends_with(prefix.as_bytes()) {
-            psql.extend_from_slice(opera.as_bytes());
-        }
-
-        push_col(psql, table, col);
-        psql.push(b' ');
-        psql.extend_from_slice(expr.as_bytes());
-        psql.extend_from_slice(b" ?");
-
-        self.0.params().push(val.to_value());
+    /// 添加in条件，类似生成
+    ///
+    /// Arguments:
+    ///
+    /// * `table`: 表名或表别名
+    /// * `col`: 字段名
+    /// * `v1`: 起始值，必须满足 v1 <= v2
+    /// * `v2`: 结束值
+    ///
+    #[inline]
+    pub fn in_<I: IntoIterator<Item = V>, V: ToValue>(mut self, table: &str, col: &str, iter: I) -> Self {
+        let open = make_col_expr(table, col, "in (");
+        utils::make_for_each(self.0.parent.sql_params(), &self.0.prefix, &self.0.prefix_overrides,
+            AND, &open, ")", ", ", &mut iter.into_iter().map(|v| v.to_value()));
+        self
     }
 
-    fn inner_like(&mut self, opera: &str, table: &str, col: &str, like_type: LikeType, val: &str) {
+}
+
+impl<T: ToValue> From<T> for InsertValue {
+    fn from(value: T) -> Self {
+        Self::Value(value.to_value())
+    }
+}
+
+mod utils {
+    use mysql_async::{prelude::ToValue, Value};
+
+    use super::{LikeType, AND, ON};
+
+    pub(crate) fn push_col(sql: &mut Vec<u8>, table: &str, col: &str) {
+        if !table.is_empty() {
+            sql.extend_from_slice(table.as_bytes());
+            sql.push(b'.');
+        }
+
+        sql.extend_from_slice(col.as_bytes());
+    }
+
+    pub(crate) fn push_col_alias(sql: &mut Vec<u8>, table: &str, col: &str, alias: &str) {
+        push_col(sql, table, col);
+
+        if !alias.is_empty() {
+            sql.extend_from_slice(b" as ");
+            sql.extend_from_slice(alias.as_bytes());
+        }
+
+        sql.push(b',');
+        sql.push(b' ');
+    }
+
+    pub(crate) fn make_col_expr(table: &str, col: &str, expr: &str) -> String {
+        debug_assert!(!col.is_empty());
+        let mut sql = String::new();
+        if !table.is_empty() {
+            sql.push_str(table);
+            sql.push('.');
+        }
+        sql.push_str(col);
+        sql.push(' ');
+        sql.push_str(expr);
+        sql
+    }
+
+    pub(crate) fn trim_add_values<I: IntoIterator<Item = V>, V: ToValue>(
+        params: &mut Vec<Value>, iter: I) -> usize
+    {
+        let len = params.len();
+        params.extend(iter.into_iter().map(|v| v.to_value()));
+        params.len() - len
+    }
+
+    pub(crate) fn trim_add_sql(buf: &mut Vec<u8>, prefix: &str,
+        prefix_overrides: &[String], sql: &str)
+    {
+        debug_assert!(!sql.is_empty());
+
+        let mut sql = sql.as_bytes();
+        let start_space = sql[0] == b' ';
+
+        if !prefix.is_empty() && buf.ends_with(prefix.as_bytes()) {
+            for item in prefix_overrides.iter() {
+                let mut item = item.as_bytes();
+                if !start_space {
+                    item = &item[1..];
+                }
+
+                if sql.starts_with(item) {
+                    sql = &sql[item.len()..];
+                    break;
+                }
+            }
+        }
+
+        if !start_space { buf.push(b' '); }
+        if !sql.is_empty() {
+            buf.extend_from_slice(sql);
+        }
+    }
+
+    pub(crate) fn make_for_each(
+        (sql, params): (&mut Vec<u8>, &mut Vec<Value>), prefix: &str,
+        prefix_overrides: &[String], sql_prefix: &str, open: &str,
+        close: &str, sep: &str, iter: &mut dyn Iterator<Item = Value>)
+    {
+        debug_assert!(!sep.is_empty());
+
+        let mut total = 0;
+
+        // 计算参数数量并记录转换参数
+        for item in iter {
+            total += 1;
+            params.push(item);
+        }
+
+        if total > 0 {
+            trim_add_sql(sql, prefix, prefix_overrides, sql_prefix);
+
+            if !open.is_empty() {
+                sql.extend_from_slice(open.as_bytes());
+            }
+
+            sql.push(b'?');
+            for _ in 1..total {
+                sql.extend_from_slice(sep.as_bytes());
+                sql.push(b'?');
+            }
+
+            if !close.is_empty() {
+                sql.extend_from_slice(close.as_bytes());
+            }
+        }
+    }
+
+    pub(crate) fn where_expr<V: ToValue>(base: (&mut Vec<u8>, &mut Vec<Value>), prefix: &str,
+        and_or: &str, table: &str, col: &str, opera: &str, val: V)
+    {
+        debug_assert!(!col.is_empty() && !opera.is_empty());
+
+        replace_prefix(base.0, prefix, and_or);
+        push_col(base.0, table, col);
+        base.0.push(b' ');
+        base.0.extend_from_slice(opera.as_bytes());
+        base.0.extend_from_slice(b" ?");
+
+        base.1.push(val.to_value());
+    }
+
+    pub(crate) fn where_like(base: (&mut Vec<u8>, &mut Vec<Value>), prefix: &str, and_or: &str,
+        table: &str, col: &str, like_type: LikeType, val: &str)
+    {
         if !val.is_empty() {
-            let mut s = CompactString::new("");
+            let mut s = String::new();
             if like_type != LikeType::Right {
                 s.push('%');
             }
@@ -1291,15 +1532,42 @@ impl<T: GeneratorSql> WhereSql<T> {
                 s.push('%');
             }
 
-            self.inner_expr(opera, table, col, "like", s.as_str());
+            where_expr(base, prefix, and_or, table, col, "like", s.as_str());
         }
     }
-}
 
-fn push_col(out: &mut Vec<u8>, table: &str, col: &str) {
-    if !table.is_empty() {
-        out.extend_from_slice(table.as_bytes());
-        out.push(b'.');
+    pub(crate) fn replace_prefix(buf: &mut Vec<u8>, prefix: &str, sql: &str) {
+        if !buf.ends_with(prefix.as_bytes()) {
+            buf.extend_from_slice(sql.as_bytes());
+        }
     }
-    out.extend_from_slice(col.as_bytes());
+
+    pub(crate) fn join_on(buf: &mut Vec<u8>, table1: &str, col1: &str, expr: &str, table2: &str, col2: &str) {
+        replace_prefix(buf, ON, AND);
+        buf.extend_from_slice(table1.as_bytes());
+        buf.extend_from_slice(b".");
+        buf.extend_from_slice(col1.as_bytes());
+        buf.push(b' ');
+        buf.extend_from_slice(expr.as_bytes());
+        buf.push(b' ');
+        if !table2.is_empty() {
+            buf.extend_from_slice(table2.as_bytes());
+            buf.extend_from_slice(b".");
+        }
+        buf.extend_from_slice(col2.as_bytes());
+    }
+
+    pub(crate) fn order_by_iter<'a>(sql: &mut Vec<u8>, iter: &mut dyn Iterator<Item = (&'a str, &'a str, bool)>) {
+        sql.extend_from_slice(b" order by ");
+        for (table, column, desc) in iter {
+            debug_assert!(!column.is_empty());
+            push_col(sql, table, column);
+            if desc {
+                sql.extend_from_slice(b" desc");
+            }
+            sql.push(b',');
+            sql.push(b' ');
+        }
+        sql.truncate(sql.len() - 2);
+    }
 }

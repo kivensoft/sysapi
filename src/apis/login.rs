@@ -1,15 +1,14 @@
 //! 用户登录相关接口
 use crate::{
-    auth,
-    entities::sys_user::{self, SysUser},
-    services::{rcache, rmq},
-    utils, AppConf, AppGlobal,
+    auth::{self, Authentication},
+    entities::sys_user,
+    services::mq,
+    utils::{self, audit, consts},
+    AppConf, AppGlobal,
 };
-use compact_str::{CompactString, ToCompactString};
-use httpserver::{fail_if, http_bail, log_error, log_info, HttpContext, HttpResponse, Resp};
+use httpserver::{fail_if, http_bail, if_else, log_info, HttpContext, HttpResponse, Resp};
 use localtime::LocalTime;
 use serde::{Deserialize, Serialize};
-
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,8 +24,8 @@ pub async fn login(ctx: HttpContext) -> HttpResponse {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Req {
-        username: CompactString,
-        password: CompactString,
+        username: String,
+        password: String,
     }
 
     type Res = LoginRes;
@@ -51,66 +50,47 @@ pub async fn login(ctx: HttpContext) -> HttpResponse {
         LocalTime::from_unix_timestamp(exp)
     };
 
+    // 写入审计日志
+    let audit_data = serde_json::json!({
+        "userId": user_id,
+        "username": param.username.to_string(),
+        "ip": ip.to_string(),
+    });
+    audit::log_json(audit::LOGIN, user_id, &audit_data);
+
     // 发布用户登录消息
-    let msg = serde_json::to_string(&SysUser {
-        user_id: Some(user_id),
-        ..Default::default()
-    })?;
-    rmq::publish_async(rmq::make_channel(rmq::ChannelName::Login), msg);
+    let chan = format!("{}:{}", AppConf::get().redis_pre, consts::CC_LOGIN);
+    mq::publish_async(chan, user_id.to_string());
     log_info!(rid, "用户[{}:{}]登录成功", user.username.unwrap(), user.user_id.unwrap());
 
-    Resp::ok(&Res {
-        token,
-        key,
-        expire,
-        user_id,
-    })
+    Resp::ok(&Res { token, key, expire, user_id })
 }
 
 /// 退出登录
 pub async fn logout(ctx: HttpContext) -> HttpResponse {
-    let rid = ctx.id;
-    let token = match auth::get_token(&ctx) {
-        Some(s) => s,
-        None => http_bail!("缺少令牌"),
+    if let Some(token) = Authentication::get_token_from_header(&ctx) {
+        // 写入审计日志
+        audit::log(audit::LOGOUT, ctx.user_id(), String::new());
+        // 发送用户登出通知消息
+        let chan = format!("{}:{}", AppConf::get().redis_pre, consts::CC_LOGOUT);
+        mq::publish_async(chan, token.to_string());
+        log_info!(ctx.id, "用户[{}]登出", ctx.uid);
     };
-    let sign = match jwt::get_sign(&token) {
-        Some(sign) => sign,
-        None => http_bail!("令牌格式错误"),
-    };
-    let cache_key = format!(
-        "{}:{}:{}",
-        AppConf::get().cache_pre,
-        rcache::CK_INVALID_TOKEN,
-        sign
-    );
-
-    // 将退出登录用户令牌的相关信息记录到缓存
-    rcache::set(&cache_key, "1", AppGlobal::get().jwt_ttl as u64).await;
-
-    // 发布用户退出登录消息
-    let msg = serde_json::to_string(&SysUser {
-        user_id: Some(ctx.uid.parse().unwrap()),
-        ..Default::default()
-    })?;
-    rmq::publish_async(rmq::make_channel(rmq::ChannelName::Logout), msg);
-    log_info!(rid, "用户[{}]登出", ctx.uid);
 
     Resp::ok_with_empty()
 }
 
 /// 获取新的token
-pub async fn refresh(ctx: HttpContext) -> HttpResponse {
+pub async fn refresh_token(ctx: HttpContext) -> HttpResponse {
     #[derive(Deserialize)]
     struct Req {
-        key: CompactString,
+        key: String,
     }
 
     type Res = LoginRes;
 
-    let rid = ctx.id;
     let user_id: u32 = ctx.uid.parse().unwrap();
-    let token = match auth::get_token(&ctx) {
+    let token = match Authentication::get_token_from_header(&ctx) {
         Some(s) => String::from(s),
         None => http_bail!("缺少令牌"),
     };
@@ -119,16 +99,17 @@ pub async fn refresh(ctx: HttpContext) -> HttpResponse {
     // 校验key是否正确
     let jwt_refresh_key = &AppConf::get().jwt_refresh;
     let right_key = sys_user::create_refresh_token(&token, jwt_refresh_key);
-    if param.key != right_key {
-        http_bail!("密钥错误");
-    }
+    fail_if!(param.key.as_str() != right_key.as_str(), "密钥错误");
 
     // 生成返回结果
     let token = sys_user::create_jwt_token(user_id)?;
     let key = sys_user::create_refresh_token(&token, jwt_refresh_key);
     let expire = (utils::time::unix_timestamp() + (AppGlobal::get().jwt_ttl as u64) * 60) as i64;
     let expire = LocalTime::from_unix_timestamp(expire);
-    log_info!(rid, "用户[{}]刷新令牌", user_id);
+    log_info!(ctx.id, "用户[{}]刷新令牌", user_id);
+
+    // 写入审计日志
+    audit::log(audit::REFRESH, ctx.user_id(), param.key.to_string());
 
     Resp::ok(&Res {
         token,
@@ -139,14 +120,13 @@ pub async fn refresh(ctx: HttpContext) -> HttpResponse {
 }
 
 /// 鉴权接口, 提供给其它微服务调用本接口进行鉴权操作
+/// 返回值中的字段 status/statuses 为鉴权的结果, 200: 允许访问, 401: 用户尚未登录, 403: 无权访问
 pub async fn authenticate(ctx: HttpContext) -> HttpResponse {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Req {
-        user_id: Option<u32>, // user_id/token两个参数只需提供1个
-        token: Option<String>,
-        path: Option<CompactString>, // path/paths两个只需提供1个
-        paths: Option<Vec<CompactString>>,
+        path: Option<String>, // path/paths两个只需提供1个
+        paths: Option<Vec<String>>,
     }
 
     #[derive(Serialize, Default)]
@@ -157,7 +137,7 @@ pub async fn authenticate(ctx: HttpContext) -> HttpResponse {
         statuses: Option<Vec<u32>>,
     }
 
-    let rid = ctx.id;
+    let auth = auth::get_authentication();
     let param: Req = ctx.parse_json()?;
 
     // path和paths必须有1个, 可校验1个或多个接口
@@ -166,31 +146,12 @@ pub async fn authenticate(ctx: HttpContext) -> HttpResponse {
     }
 
     // user_id和token都为空的情况下, 表示用户未登录
-    let uid = match &param.user_id {
-        Some(v) => *v,
-        None => match &param.token {
-            Some(token) => match auth::decode_token(rid, token) {
-                Ok(uid) => match uid.parse() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        log_error!(rid, "token的uid格式不为整数");
-                        http_bail!("token的uid格式错误")
-                    }
-                },
-                Err(e) => {
-                    log_error!(rid, "解码token错误: {e:?}");
-                    http_bail!("无效token")
-                }
-            },
-            None => 0,
-        },
-    };
-
-    let user_id = if uid == 0 { None } else { Some(uid) };
-    let uid_str = uid.to_compact_string();
+    let uid = ctx.user_id();
+    let user_id = if_else!(uid != 0, Some(uid), None);
+    let uid_str = &ctx.uid;
 
     if let Some(path) = &param.path {
-        let status = auth_status(uid, auth::auth(rid, &uid_str, path).await);
+        let status = auth_status(uid, auth.auth(ctx.id, uid_str, path).await);
 
         return Resp::ok(&Res {
             user_id,
@@ -202,7 +163,7 @@ pub async fn authenticate(ctx: HttpContext) -> HttpResponse {
     let paths = param.paths.unwrap();
     let mut statuses = Vec::with_capacity(paths.len());
     for path in paths.iter() {
-        let status = auth_status(uid, auth::auth(rid, &uid_str, path).await);
+        let status = auth_status(uid, auth.auth(ctx.id, uid_str, path).await);
         statuses.push(status);
     }
 

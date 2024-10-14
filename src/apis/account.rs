@@ -1,8 +1,8 @@
 //! 当前登录用户相关接口
 use crate::{
     entities::{sys_menu::SysMenu, sys_role::SysRole, sys_user::SysUser},
-    services::rcache,
-    utils::{bits, md5_crypt},
+    services::uri,
+    utils::{audit, bits, md5_crypt},
     AppConf,
 };
 use anyhow_ext::Result;
@@ -25,11 +25,11 @@ struct AuthCodeInfo {
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct LocalSysMenu {
+pub struct LocalSysMenu<'a> {
     #[serde(flatten)]
-    pub menu: SysMenu,
+    pub menu: &'a SysMenu,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub menus: Option<Vec<LocalSysMenu>>,
+    pub menus: Option<Vec<LocalSysMenu<'a>>>,
 }
 
 /// 获取当前账号配置信息
@@ -113,7 +113,25 @@ pub async fn update(ctx: HttpContext) -> HttpResponse {
         ..Default::default()
     };
 
-    SysUser::update_by_id_selective(sys_user).await?;
+    let audit_data = sys_user.clone();
+    let orig = match SysUser::select_by_id(user_id).await? {
+        Some(v) => v,
+        None => http_bail!("用户不存在"),
+    };
+
+    // 写入数据库
+    sys_user.update_by_id().await?;
+
+    // 写入审计日志
+    audit::log_diff(
+        audit::ACCOUNT_UPD,
+        ctx.user_id(),
+        &audit_data,
+        &orig,
+        &[SysUser::USER_ID],
+        &[SysUser::UPDATED_TIME],
+    );
+
     Resp::ok_with_empty()
 }
 
@@ -136,9 +154,9 @@ pub async fn change_password(ctx: HttpContext) -> HttpResponse {
     let checked = md5_crypt::verify(&param.old_password, sys_user.password.as_ref().unwrap())
         .map_err(|_| http_error!("无法校验口令"))?;
     fail_if!(!checked, "旧密码不正确");
-
-    let pwd = md5_crypt::encrypt(&param.new_password)
-        .map_err(|_| http_error!("无法生成加密口令"))?;
+    // 生成新的加密口令
+    let pwd =
+        md5_crypt::encrypt(&param.new_password).map_err(|_| http_error!("无法生成加密口令"))?;
 
     let sys_user = SysUser {
         user_id: Some(user_id),
@@ -146,8 +164,14 @@ pub async fn change_password(ctx: HttpContext) -> HttpResponse {
         updated_time: Some(LocalTime::now()),
         ..Default::default()
     };
+    let mut audit_data = sys_user.clone();
 
-    SysUser::update_by_id_selective(sys_user).await?;
+    // 写入数据库
+    sys_user.update_by_id().await?;
+    // 写入审计日志
+    audit_data.updated_time = None;
+    audit::log_json(audit::ACCOUNT_UPD_PASSWORD, user_id, &audit_data);
+
     Resp::ok_with_empty()
 }
 
@@ -163,7 +187,7 @@ pub async fn change_mobile(ctx: HttpContext) -> HttpResponse {
     let user_id = ctx.uid.parse().unwrap();
     let param: Req = ctx.parse_json()?;
 
-    check_auth_code(rcache::CK_MOBILE_AUTH_CODE, &param.mobile, &param.auth_code).await?;
+    check_auth_code(uri::CK_MOBILE_AUTH_CODE, &param.mobile, &param.auth_code).await?;
 
     let sys_user = SysUser {
         user_id: Some(user_id),
@@ -171,8 +195,14 @@ pub async fn change_mobile(ctx: HttpContext) -> HttpResponse {
         updated_time: Some(LocalTime::now()),
         ..Default::default()
     };
+    let mut audit_data = sys_user.clone();
 
-    SysUser::update_by_id_selective(sys_user).await?;
+    // 写入数据库
+    sys_user.update_by_id().await?;
+    // 写入审计日志
+    audit_data.updated_time = None;
+    audit::log_json(audit::ACCOUNT_UPD_MOBILE, user_id, &audit_data);
+
     Resp::ok_with_empty()
 }
 
@@ -188,7 +218,7 @@ pub async fn change_email(ctx: HttpContext) -> HttpResponse {
     let user_id = ctx.uid.parse().unwrap();
     let param: Req = ctx.parse_json()?;
 
-    check_auth_code(rcache::CK_EMAIL_AUTH_CODE, &param.email, &param.auth_code).await?;
+    check_auth_code(uri::CK_EMAIL_AUTH_CODE, &param.email, &param.auth_code).await?;
 
     let sys_user = SysUser {
         user_id: Some(user_id),
@@ -196,8 +226,14 @@ pub async fn change_email(ctx: HttpContext) -> HttpResponse {
         updated_time: Some(LocalTime::now()),
         ..Default::default()
     };
+    let mut audit_data = sys_user.clone();
 
-    SysUser::update_by_id_selective(sys_user).await?;
+    // 写入数据库
+    sys_user.update_by_id().await?;
+    // 写入审计日志
+    audit_data.updated_time = None;
+    audit::log_json(audit::ACCOUNT_UPD_EMAIL, user_id, &audit_data);
+
     Resp::ok_with_empty()
 }
 
@@ -206,34 +242,35 @@ pub async fn menus(ctx: HttpContext) -> HttpResponse {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Req {
-        client_type: u16,
+        client_type: i16,
     }
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
-    struct Res {
-        menus: Vec<LocalSysMenu>,
+    struct Res<'a> {
+        menus: Vec<LocalSysMenu<'a>>,
     }
 
     let user_id = ctx.uid.parse().unwrap();
     let param: Req = ctx.parse_json()?;
     let user_permits = SysUser::select_permissions_by_id(user_id)
         .await?
-        .ok_or_else(|| http_error!("用户/角色记录不存在"))?;
+        .ok_or_else(|| http_error!("账号对应的角色丢失"))?;
 
-    let all_menus = SysMenu::select_by_client_type(param.client_type)
-        .await?;
-    let user_menus = filter_user_menus(all_menus, &user_permits);
+    let all_menus = SysMenu::select_by_client_type(param.client_type).await?;
+    let user_menus = filter_user_menus(&all_menus, &user_permits);
 
     // 将扁平结构的菜单列表转成树结构
-    let menus = convert_to_tree(user_menus);
+    let mut menus = convert_to_tree(user_menus);
+    // 递归删除叶子节点中不带链接的菜单项
+    trim_empty_menu(&mut menus);
 
     Resp::ok(&Res { menus })
 }
 
 async fn check_auth_code(key_type: &str, key: &str, code: &str) -> Result<()> {
-    let key = format!("{}:{}:{}", AppConf::get().cache_pre, key_type, key);
-    let value: String = match rcache::get(&key).await {
+    let key = format!("{}:{}:{}", AppConf::get().redis_pre, key_type, key);
+    let value: String = match uri::get(&key).await {
         Some(v) => v,
         None => http_bail!("验证码已失效, 请重新发送"),
     };
@@ -247,68 +284,55 @@ async fn check_auth_code(key_type: &str, key: &str, code: &str) -> Result<()> {
         if aci.try_count < MAX_FAIL_COUNT {
             aci.try_count += 1;
             let value = serde_json::to_string(&aci).unwrap();
-            rcache::set(&key, &value, AUTH_CODE_TTL as u64).await;
+            uri::set(&key, &value, AUTH_CODE_TTL as u64).await;
         } else {
-            rcache::del(&key).await;
+            uri::del(&key).await;
         }
         http_bail!("验证码错误");
     }
 
-    rcache::del(&key).await;
+    uri::del(&key).await;
 
     Ok(())
 }
 
 /// 根据参数permits，过滤menus，返回该permits有权限访问的菜单列表
-fn filter_user_menus<'a>(menus: Vec<SysMenu>, permits: &str) -> Vec<SysMenu> {
+fn filter_user_menus<'a>(menus: &'a [SysMenu], permits: &str) -> Vec<&'a SysMenu> {
     let pbs = bits::string_to_bools(permits);
     let pbs_len = pbs.len() as i16;
     let mut user_menus = Vec::new();
 
     for menu in menus {
         let pcode = menu.permission_code.unwrap();
-        // 权限索引为负数或者对应的权限位允许
+        // 权限索引为负数或者对应的权限位允许, 在数组中添加菜单项
         if pcode < 0 || (pcode < pbs_len && pbs[pcode as usize]) {
-            // 如果当前菜单是一级菜单并且最后一个菜单也是一级菜单且最后菜单链接为"#"", 则删除
-            // if menu.menu_code.as_ref().unwrap().len() == 2 {
-            //     // 删除菜单列表中的菜单链接内容为"#"的菜单
-            //     trim_empty_menu(&mut user_menus);
-            // }
-            // 在数组中添加菜单项
             user_menus.push(menu);
         }
     }
-
-    // 删除菜单列表中的菜单链接内容为"#"的菜单
-    // trim_empty_menu(&mut user_menus);
 
     user_menus
 }
 
 /// 删除菜单列表中的菜单链接内容为"#"的菜单，该菜单项表示为有下级子菜单
-fn trim_empty_menu(menus: Vec<LocalSysMenu>) -> Vec<LocalSysMenu> {
-    for menu in menus {
-        if let Some(menus) = &menu.menus {}
-    }
-    todo!()
-    // let len = menus.len();
-    // if len == 0 {
-    //     return;
+fn trim_empty_menu(menus: &mut Vec<LocalSysMenu>) {
+    // for menu in menus.iter_mut() {
+    //     if let Some(children) = menu.menus.as_mut() {
+    //         children.retain(|m| m.menu.menu_link.as_ref().unwrap() != "#");
+    //     }
     // }
-
-    // let last_menu = &menus[len - 1];
-    // if last_menu.menu_code.as_ref().unwrap().len() != 2 {
-    //     return;
-    // }
-
-    // let link = last_menu.menu_link.as_ref().unwrap();
-    // if "#" == link {
-    //     menus.pop();
-    // }
+    menus.retain(|m| {
+        if m.menu.menu_link.as_ref().unwrap() == "#" {
+            return match &m.menus {
+                Some(children) => !children.is_empty(),
+                None => false,
+            };
+        }
+        true
+    });
 }
 
 /// 将扁平化的菜单列表转换为树形结构
-fn convert_to_tree(menus: Vec<SysMenu>) -> Vec<LocalSysMenu> {
+fn convert_to_tree(menus: Vec<&SysMenu>) -> Vec<LocalSysMenu> {
     let mut tree_menus = Vec::new();
 
     // 将扁平结构的菜单列表转成树结构
@@ -365,33 +389,14 @@ mod tests {
             menus.push(item);
         }
 
-        let user_menus = super::filter_user_menus(menus.clone(), "80");
-        let check_data = ["01", "02", "0201", "0202", "04"];
+        // 测试权限过滤模式
+        let user_menus = super::filter_user_menus(&menus, "80");
+        let check_data = ["01", "02", "0201", "0202", "03", "04"];
         for i in 0..check_data.len() {
             assert_eq!(check_data[i], user_menus[i].menu_code.as_ref().unwrap());
         }
 
-        let user_menus = super::convert_to_tree(user_menus);
-        let check_data = ["01", "02", "04"];
-        for i in 0..check_data.len() {
-            assert_eq!(
-                check_data[i],
-                user_menus[i].menu.menu_code.as_ref().unwrap()
-            );
-        }
-
-        let sub_menus = &user_menus[1].menus.as_ref().unwrap();
-        let check_data = ["0201", "0202"];
-        for i in 0..check_data.len() {
-            assert_eq!(check_data[i], sub_menus[i].menu.menu_code.as_ref().unwrap());
-        }
-
-        let user_menus = super::filter_user_menus(menus, "c0");
-        let check_data = ["01", "02", "0201", "0202", "03", "0301", "04"];
-        for i in 0..check_data.len() {
-            assert_eq!(check_data[i], user_menus[i].menu_code.as_ref().unwrap());
-        }
-
+        // 测试菜单树化
         let user_menus = super::convert_to_tree(user_menus);
         let check_data = ["01", "02", "03", "04"];
         for i in 0..check_data.len() {
@@ -400,13 +405,33 @@ mod tests {
                 user_menus[i].menu.menu_code.as_ref().unwrap()
             );
         }
-
         let sub_menus = &user_menus[1].menus.as_ref().unwrap();
         let check_data = ["0201", "0202"];
         for i in 0..check_data.len() {
             assert_eq!(check_data[i], sub_menus[i].menu.menu_code.as_ref().unwrap());
         }
 
+        // 测试权限过滤模式
+        let user_menus = super::filter_user_menus(&menus, "c0");
+        let check_data = ["01", "02", "0201", "0202", "03", "0301", "04"];
+        for i in 0..check_data.len() {
+            assert_eq!(check_data[i], user_menus[i].menu_code.as_ref().unwrap());
+        }
+
+        // 测试菜单树化
+        let user_menus = super::convert_to_tree(user_menus);
+        let check_data = ["01", "02", "03", "04"];
+        for i in 0..check_data.len() {
+            assert_eq!(
+                check_data[i],
+                user_menus[i].menu.menu_code.as_ref().unwrap()
+            );
+        }
+        let sub_menus = &user_menus[1].menus.as_ref().unwrap();
+        let check_data = ["0201", "0202"];
+        for i in 0..check_data.len() {
+            assert_eq!(check_data[i], sub_menus[i].menu.menu_code.as_ref().unwrap());
+        }
         let sub_menus = &user_menus[2].menus.as_ref().unwrap();
         let check_data = ["0301"];
         for i in 0..check_data.len() {

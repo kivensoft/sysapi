@@ -1,6 +1,5 @@
 //! MD5 Crypt(3) 自定义MD5加密算法实现
 use anyhow_ext::{bail, Context, Result};
-use md5::{Digest, Md5};
 use rand::Rng;
 
 const SALT_LEN: usize = 8;
@@ -57,7 +56,9 @@ pub fn verify(pw_plain: &str, pw_encrypt: &str) -> Result<bool> {
         log::trace!(
             "密码校验错误: 原密码 = [{}], 计算结果 = [{}], 期望结果 = [{}]",
             pw_plain,
-            std::str::from_utf8(&pass_out).context("md5校验失败: 非法utf8字符").dot()?,
+            std::str::from_utf8(&pass_out)
+                .context("md5校验失败: 非法utf8字符")
+                .dot()?,
             pw_encrypt
         );
     }
@@ -112,11 +113,11 @@ fn do_encrypt(out: &mut [u8], password: &[u8], salt: &[u8]) {
     debug_assert!(out.len() >= PWD_LEN && salt.len() == SALT_LEN);
 
     // 计算 salt_prefix + salt + password 的 md5
-    let mut hasher = Md5::new();
-    hasher.update(SALT_MAGIC.as_bytes());
-    hasher.update(salt);
-    hasher.update(password);
-    let final_state = hasher.finalize();
+    let mut hasher = md5::Context::new();
+    hasher.consume(SALT_MAGIC.as_bytes());
+    hasher.consume(salt);
+    hasher.consume(password);
+    let final_state = hasher.compute();
 
     // 将 "$1$" 写入返回参数
     let fs = &mut out[..SALT_MAGIC.len()];
@@ -131,7 +132,7 @@ fn do_encrypt(out: &mut [u8], password: &[u8], salt: &[u8]) {
 
     // 将 password 加密后的结果进行base64编码，并写入返回参数
     let fs = &mut out[DIGEST_OFFSET..];
-    to_base64(fs, &final_state, CRYPT_B64_CHARS);
+    to_base64(fs, &final_state[..], CRYPT_B64_CHARS);
 }
 
 fn to_base64(out: &mut [u8], input: &[u8], alphabet: &[u8]) -> usize {

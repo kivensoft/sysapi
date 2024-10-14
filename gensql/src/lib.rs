@@ -12,16 +12,18 @@ cfg_if::cfg_if! {
 }
 
 pub use db::{
-    get_conn, init_pool, sql_exec, sql_insert, sql_query, sql_query_fast, sql_query_one,
-    start_transaction, try_connect, Column, Conn, DbError, DbResult, FastFromRow, FromRow,
-    FromRowError, FromValue, FromValueError, Params, Queryable, Row, StatementLike, ToValue,
-    Transaction, Value,
+    get_conn, init_pool, sql_exec, sql_insert, sql_query, sql_query_fast,
+    sql_query_map, sql_query_one, start_transaction, try_connect, Column,
+    Conn, DbConfig, DbError, DbResult, FastFromRow, FromRow, FromRowError,
+    FromValue, FromValueError, Params, Queryable, Row, StatementLike,
+    ToValue, Transaction, Value,
 };
 pub use gensql_derive::table;
 pub use serde;
 pub use sql_builder::{
-    db_log_params, db_log_sql, db_log_sql_params, trans_to_select_count, DeleteSql, GenSqlError,
-    InsertSql, SelectSql, TrimSql, UpdateSql, WhereSql,
+    db_log_params, db_log_sql, db_log_sql_params, trans_to_select_count,
+    BatchDeleteSql, BatchInsertSql, DeleteSql, GenSqlError,
+    InsertSql, InsertValue, SelectSql, TrimSql, UpdateSql, WhereSql,
 };
 
 #[macro_export]

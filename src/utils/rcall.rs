@@ -1,6 +1,5 @@
 //! 远程调用服务
 use anyhow_ext::{Context, Result};
-use compact_str::CompactString;
 use http_body_util::{BodyExt, Full};
 use httpserver::{ApiResult, Bytes};
 use hyper::{body::Buf, Method, Request};
@@ -80,7 +79,6 @@ pub async fn reg_to_gateway() -> Result<()> {
 }
 
 /// 远程调用网关服务器的token生成服务
-#[allow(dead_code)]
 pub async fn gen_token<T: Serialize>(claim: &T) -> Result<String> {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -109,7 +107,7 @@ pub async fn gen_token<T: Serialize>(claim: &T) -> Result<String> {
 pub async fn load_config(cfg_name: &str) -> Result<Vec<CfgItem>> {
     #[derive(Serialize)]
     struct Req {
-        group: CompactString,
+        group: String,
     }
 
     #[derive(Deserialize)]
@@ -121,7 +119,7 @@ pub async fn load_config(cfg_name: &str) -> Result<Vec<CfgItem>> {
     let res = post::<_, Res>(
         CFG_PATH,
         &Req {
-            group: CompactString::new(cfg_name),
+            group: String::from(cfg_name),
         },
     )
     .await
@@ -137,13 +135,11 @@ where
     T: Serialize,
     R: DeserializeOwned,
 {
-    use compact_str::format_compact as fmt;
-
     let req = Request::builder()
         .method(Method::POST)
         .uri(format!("http://{}{}", AppConf::get().gateway, path))
         .body(Full::<Bytes>::from(serde_json::to_vec(param)?))
-        .with_context(|| fmt!("远程调用{path}, 构建请求体对象失败"))?;
+        .with_context(|| format!("远程调用{path}, 构建请求体对象失败"))?;
 
     let mut hc = HttpConnector::new();
     hc.set_connect_timeout(Some(Duration::from_secs(CONNECT_TIMEOUT as u64)));
@@ -154,7 +150,7 @@ where
 
     if body.has_remaining() {
         let ar: ApiResult<R> = serde_json::from_reader(body.reader())
-            .with_context(|| fmt!("远程调用{path}, 反序列化结果失败"))?;
+            .with_context(|| format!("远程调用{path}, 反序列化结果失败"))?;
 
         if ar.is_ok() {
             Ok(ar.data)

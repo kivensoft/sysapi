@@ -1,6 +1,6 @@
 [package]
 name = "gensql_derive"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 authors = ["kiven <kivensoft@gmail.com>"]
 description = "gensql table derive"

@@ -2,6 +2,8 @@
 // author: kiven
 // slince 2023-08-24
 
+use std::mem::MaybeUninit;
+
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use mysql_async::prelude::Queryable as QA;
@@ -14,6 +16,14 @@ pub use mysql_async::{
 use mysql_async::{Pool, TxOpts};
 
 pub type DbResult<T> = Result<T, DbError>;
+
+pub struct DbConfig<'a> {
+    pub host: &'a str,
+    pub port: &'a str,
+    pub user: &'a str,
+    pub pass: &'a str,
+    pub db: &'a str,
+}
 
 pub trait FastFromRow {
     fn fast_from_row(index_vec: &[i32], row: Row) -> Self;
@@ -45,7 +55,17 @@ pub trait Queryable {
         P: Into<Params> + Send + 'a,
         T: FromRow + Send + 'static;
 
-    fn query<'a, S, P, F, U>(
+    fn query<'a, S, P, T>(
+        &'a mut self,
+        stmt: S,
+        params: P,
+    ) -> BoxFuture<'a, DbResult<Vec<T>>>
+    where
+        S: StatementLike + 'a,
+        P: Into<Params> + Send + 'a,
+        T: FromRow + Send + 'static;
+
+    fn query_map<'a, S, P, F, U>(
         &'a mut self,
         stmt: S,
         params: P,
@@ -91,24 +111,15 @@ pub trait Queryable {
 pub struct Conn(mysql_async::Conn);
 pub struct Transaction<'a>(mysql_async::Transaction<'a>);
 
-static mut DB_POOL: std::mem::MaybeUninit<Pool> = std::mem::MaybeUninit::uninit();
+static mut DB_POOL: MaybeUninit<Pool> = MaybeUninit::uninit();
 #[cfg(debug_assertions)]
 static mut INITED: bool = false;
 
 /// 初始化连接池(必须在程序开始时调用)
-pub fn init_pool(user: &str, pass: &str, host: &str, port: &str, db: &str) -> DbResult<()> {
-    let url = format!("mysql://{}:{}@{}:{}/{}", user, pass, host, port, db);
-    let p = Pool::from_url(url)?;
-    unsafe {
-        #[cfg(debug_assertions)]
-        {
-            if INITED {
-                panic!("init_pool already run");
-            }
-            INITED = true;
-        }
-        DB_POOL.write(p);
-    }
+pub fn init_pool(cfg: DbConfig) -> DbResult<()> {
+    let port = cfg.port.parse::<u32>().unwrap_or(3306);
+    let url = format!("mysql://{}:{}@{}:{}/{}", cfg.user, cfg.pass, cfg.host, port, cfg.db);
+    init_db_pool(Pool::from_url(url)?);
     Ok(())
 }
 
@@ -167,7 +178,18 @@ where
 }
 
 /// 执行查询多条记录的sql, 返回记录列表
-pub async fn sql_query<S, P, F, U>(stmt: S, params: P, f: F) -> DbResult<Vec<U>>
+pub async fn sql_query<S, P, T>(stmt: S, params: P) -> DbResult<Vec<T>>
+where
+    S: StatementLike,
+    P: Into<Params> + Send,
+    T: FromRow + Send + 'static,
+{
+    let mut conn = get_db_pool().get_conn().await?;
+    QA::exec(&mut conn, stmt, params).await
+}
+
+/// 执行查询多条记录的sql, 返回记录列表
+pub async fn sql_query_map<S, P, F, U>(stmt: S, params: P, f: F) -> DbResult<Vec<U>>
 where
     S: StatementLike,
     P: Into<Params> + Send,
@@ -260,7 +282,20 @@ impl Queryable for Conn {
         QA::exec_first(&mut self.0, stmt, params)
     }
 
-    fn query<'a, S, P, F, U>(
+    fn query<'a, S, P, T>(
+        &'a mut self,
+        stmt: S,
+        params: P,
+    ) -> BoxFuture<'a, DbResult<Vec<T>>>
+    where
+        S: StatementLike + 'a,
+        P: Into<Params> + Send + 'a,
+        T: FromRow + Send + 'static,
+    {
+        QA::exec(&mut self.0, stmt, params)
+    }
+
+    fn query_map<'a, S, P, F, U>(
         &'a mut self,
         stmt: S,
         params: P,
@@ -367,7 +402,20 @@ impl Queryable for Transaction<'_> {
         QA::exec_first(&mut self.0, stmt, params)
     }
 
-    fn query<'a, S, P, F, U>(
+    fn query<'a, S, P, T>(
+        &'a mut self,
+        stmt: S,
+        params: P,
+    ) -> BoxFuture<'a, DbResult<Vec<T>>>
+    where
+        S: StatementLike + 'a,
+        P: Into<Params> + Send + 'a,
+        T: FromRow + Send + 'static,
+    {
+        QA::exec(&mut self.0, stmt, params)
+    }
+
+    fn query_map<'a, S, P, F, U>(
         &'a mut self,
         stmt: S,
         params: P,
@@ -429,6 +477,19 @@ impl Transaction<'_> {
 
     pub async fn rollback(self) -> DbResult<()> {
         Ok(self.0.rollback().await?)
+    }
+}
+
+fn init_db_pool(pool: Pool) {
+    unsafe {
+        #[cfg(debug_assertions)]
+        {
+            if INITED {
+                panic!("DB_POOL has been initialized. Procedure");
+            }
+            INITED = true;
+        }
+        DB_POOL.write(pool);
     }
 }
 

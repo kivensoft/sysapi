@@ -159,10 +159,11 @@ pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
         );
         let update_fields: Vec<_> = update_fields.iter()
             .map(|f| &f.field.ident).collect();
-        let select_sql = format!(
-            "select {} from {} {}",
-            table_field_names, table_name, where_sql
-        );
+        // let select_sql = format!(
+        //     "select {} from {} {}",
+        //     table_field_names, table_name, where_sql
+        // );
+        let select_sql = format!("select * from {} {}", table_name, where_sql);
         let select_valid_dyn_values = all_fields
             .iter()
             .filter(|v| !v.not_field && !v.ignore && !v.serde_flatten)
@@ -170,7 +171,7 @@ pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let f = &v.field.ident;
                 let a = &v.alias;
                 quote!(
-                    if let Some(v) = value.#f {
+                    if let Some(v) = self.#f {
                         fields.push(#a);
                         params.push(v.into());
                     }
@@ -183,7 +184,7 @@ pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let f = &v.field.ident;
                 let a = &v.alias;
                 quote!(
-                    if let Some(v) = value.#f {
+                    if let Some(v) = self.#f {
                         fields.push(#a);
                         params.push(v.into());
                     }
@@ -191,7 +192,7 @@ pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
             }).collect();
         update_valid_dyn_values.push(
             quote!(
-                if let Some(v) = value.#id_name {
+                if let Some(v) = self.#id_name {
                     params.push(v.into());
                 }
             )
@@ -199,11 +200,12 @@ pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         out.extend(quote! {
             impl #struct_name {
-                /// 插入记录，不忽略None值，返回(插入记录数量, 自增ID的值)
-                pub async fn insert(value: #struct_name) -> gensql::DbResult<(u32, u32)> {
-                    let (sql, params) = Self::prepare_insert(value);
+                /// 查找记录，参数为记录id
+                pub async fn select_by_id(id: #id_type) -> gensql::DbResult<Option<#struct_name>> {
+                    let sql = Self::sql_select_by_id();
+                    let params: Vec<gensql::Value> = vec![id.into()];
                     gensql::db_log_sql_params(&sql, &params);
-                    gensql::sql_insert(sql, params).await
+                    gensql::sql_query_one(sql, params).await
                 }
 
                 /// 删除记录，参数为记录id，返回删除是否成功标志
@@ -214,52 +216,37 @@ pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Ok(gensql::sql_exec(sql, params).await? > 0)
                 }
 
-                /// 更新记录，不忽略None值，以id为条件进行定位修改，返回修改是否成功标志
-                pub async fn update_by_id(value: #struct_name) -> gensql::DbResult<bool> {
-                    let (sql, params) = Self::prepare_update_by_id(value);
-                    gensql::db_log_sql_params(&sql, &params);
-                    Ok(gensql::sql_exec(sql, params).await? > 0)
-                }
-
-                /// 查找记录，参数为记录id
-                pub async fn select_by_id(id: #id_type) -> gensql::DbResult<Option<#struct_name>> {
-                    let sql = Self::sql_select_by_id();
-                    let params: Vec<gensql::Value> = vec![id.into()];
-                    gensql::db_log_sql_params(&sql, &params);
-                    gensql::sql_query_one(sql, params).await
-                }
-
                 /// 插入记录，忽略None值，返回(插入记录数量, 自增ID的值)
-                pub async fn insert_selective(value: #struct_name) -> gensql::DbResult<(u32, u32)> {
-                    let (sql, params) = Self::prepare_insert_selective(value);
+                pub async fn insert(self) -> gensql::DbResult<(u32, u32)> {
+                    let (sql, params) = self.prepare_insert();
+                    gensql::db_log_sql_params(&sql, &params);
+                    gensql::sql_insert(sql, params).await
+                }
+
+                /// 插入记录，不忽略None值，返回(插入记录数量, 自增ID的值)
+                pub async fn insert_inselective(self) -> gensql::DbResult<(u32, u32)> {
+                    let (sql, params) = self.prepare_insert_inselective();
                     gensql::db_log_sql_params(&sql, &params);
                     gensql::sql_insert(sql, params).await
                 }
 
                 /// 更新记录，忽略None值，以id为条件进行定位修改，返回修改是否成功标志
-                pub async fn update_by_id_selective(value: #struct_name) -> gensql::DbResult<bool> {
-                    let (sql, params) = Self::prepare_update_by_id_selective(value);
+                pub async fn update_by_id(self) -> gensql::DbResult<bool> {
+                    let (sql, params) = self.prepare_update_by_id();
                     gensql::db_log_sql_params(&sql, &params);
                     Ok(gensql::sql_exec(sql, params).await? > 0)
                 }
 
-                /// 插入记录，不忽略None值，返回(插入记录数量, 自增ID的值)
-                pub fn prepare_insert(value: #struct_name) -> (&'static str, Vec<gensql::Value>) {
-                    let sql = #insert_sql;
-                    let params: Vec<gensql::Value> = vec![#(value.#table_field_arr.into()),*];
-                    (sql, params)
+                /// 更新记录，不忽略None值，以id为条件进行定位修改，返回修改是否成功标志
+                pub async fn update_by_id_inselective(self) -> gensql::DbResult<bool> {
+                    let (sql, params) = self.prepare_update_by_id_inselective();
+                    gensql::db_log_sql_params(&sql, &params);
+                    Ok(gensql::sql_exec(sql, params).await? > 0)
                 }
 
                 /// 删除记录，参数为记录id，返回删除是否成功标志
                 pub fn sql_delete_by_id() -> &'static str {
                     #delete_sql
-                }
-
-                /// 更新记录，不忽略None值，以id为条件进行定位修改，返回修改是否成功标志
-                pub fn prepare_update_by_id(value: #struct_name) -> (&'static str, Vec<gensql::Value>) {
-                    let sql = #update_sql;
-                    let params: Vec<gensql::Value> = vec![#(value.#update_fields.into()),* , value.#id_name.into()];
-                    (sql, params)
                 }
 
                 /// 查找记录，参数为记录id
@@ -268,7 +255,7 @@ pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
 
                 /// 插入记录，忽略None值，返回(插入记录数量, 自增ID的值)
-                pub fn prepare_insert_selective(value: #struct_name) -> (String, Vec<gensql::Value>) {
+                pub fn prepare_insert(self) -> (String, Vec<gensql::Value>) {
                     // 找出所有不为None的值和对应的字段名
                     let mut fields = Vec::with_capacity(32);
                     let mut params = Vec::<gensql::Value>::with_capacity(32);
@@ -292,8 +279,15 @@ pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
                     (sql, params)
                 }
 
+                /// 插入记录，不忽略None值，返回(插入记录数量, 自增ID的值)
+                pub fn prepare_insert_inselective(self) -> (&'static str, Vec<gensql::Value>) {
+                    let sql = #insert_sql;
+                    let params: Vec<gensql::Value> = vec![#(self.#table_field_arr.into()),*];
+                    (sql, params)
+                }
+
                 /// 更新记录，忽略None值，以id为条件进行定位修改，返回修改是否成功标志
-                pub fn prepare_update_by_id_selective(value: #struct_name) -> (String, Vec<gensql::Value>) {
+                pub fn prepare_update_by_id(self) -> (String, Vec<gensql::Value>) {
                     // 找出所有不为None的值和对应的字段名, 注意：id需要排到最后，因为id是where条件
                     let mut fields = Vec::with_capacity(32);
                     let mut params = Vec::<gensql::Value>::with_capacity(32);
@@ -310,6 +304,13 @@ pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
                     sql.push(' ');
                     sql.push_str(#where_sql);
 
+                    (sql, params)
+                }
+
+                /// 更新记录，不忽略None值，以id为条件进行定位修改，返回修改是否成功标志
+                pub fn prepare_update_by_id_inselective(self) -> (&'static str, Vec<gensql::Value>) {
+                    let sql = #update_sql;
+                    let params: Vec<gensql::Value> = vec![#(self.#update_fields.into()),* , self.#id_name.into()];
                     (sql, params)
                 }
             }

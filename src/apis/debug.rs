@@ -1,16 +1,22 @@
 //! 内部调试接口
-use crate::{services::{rcache, rmq::ChannelName}, utils::mq_util::{emit, RecChanged}, AppGlobal};
+use crate::{services::{mq, uri}, utils::consts, AppConf, AppGlobal};
 use anyhow_ext::Context;
-use compact_str::CompactString;
 use httpserver::{HttpContext, HttpResponse, Resp};
 use localtime::LocalTime;
 use serde::{Deserialize, Serialize};
 
 /// 重置权限
-pub async fn reset_permission(ctx: HttpContext) -> HttpResponse {
-    emit(ctx.id, ChannelName::ModRole, &RecChanged::with_all());
-    emit(ctx.id, ChannelName::ModApi, &RecChanged::with_all());
-    emit(ctx.id, ChannelName::ModUser, &RecChanged::with_all());
+pub async fn reset_permission(_ctx: HttpContext) -> HttpResponse {
+    let prefix = format!("{}:{}:", AppConf::get().redis_pre, consts::gmc::MOD_KEY);
+    let empty = String::with_capacity(0);
+    let keys = [consts::gmc::SYS_ROLE, consts::gmc::SYS_API, consts::gmc::SYS_USER];
+
+    for k in keys {
+        let mut key = prefix.clone();
+        key.push_str(k);
+        mq::publish(&key, &empty).await.dot()?;
+    }
+
     Resp::ok_with_empty()
 }
 
@@ -33,21 +39,21 @@ pub async fn redis_clear(_ctx: HttpContext) -> HttpResponse {
 pub async fn redis_get(ctx: HttpContext) -> HttpResponse {
     #[derive(Deserialize)]
     struct Req {
-        key: CompactString,
+        key: String,
         zflag: Option<bool>,
     }
 
     #[derive(Serialize)]
-    // #[serde(rename_all = "camelCase")]
+    #[serde(rename_all = "camelCase")]
     struct Res {
         value: Option<String>,
     }
 
     let req_param: Req = ctx.parse_json()?;
     let value = if req_param.zflag.is_some() && req_param.zflag.unwrap() {
-        rcache::lz4_get(&req_param.key).await
+        uri::get_lz4(&req_param.key).await
     } else {
-        rcache::get(&req_param.key).await
+        uri::get(&req_param.key).await
     };
     let value = match value {
         Some(v) => Some(String::from_utf8(v).context("校验字符串utf8格式失败")?),
@@ -61,13 +67,13 @@ pub async fn redis_get(ctx: HttpContext) -> HttpResponse {
 pub async fn redis_set(ctx: HttpContext) -> HttpResponse {
     #[derive(Deserialize)]
     struct Req {
-        key: CompactString,
-        value: CompactString,
+        key: String,
+        value: String,
         ttl: u64,
     }
 
     let param: Req = ctx.parse_json()?;
-    rcache::set(&param.key, param.value.as_str(), param.ttl).await;
+    uri::set(&param.key, param.value.as_str(), param.ttl).await;
 
     Resp::ok_with_empty()
 }

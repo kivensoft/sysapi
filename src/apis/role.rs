@@ -1,11 +1,10 @@
 //! 角色表接口
 use crate::{
     entities::{sys_role::SysRole, PageData, PageQuery},
-    services::rmq::ChannelName,
-    utils::mq_util::{emit, RecChanged},
+    utils::audit,
 };
 use anyhow_ext::anyhow;
-use httpserver::{check_required, HttpContext, HttpResponse, Resp};
+use httpserver::{check_required, http_bail, HttpContext, HttpResponse, Resp};
 use localtime::LocalTime;
 
 /// 记录列表
@@ -14,8 +13,7 @@ pub async fn list(ctx: HttpContext) -> HttpResponse {
 
     let param: Req = ctx.parse_json()?;
     let pg = param.page_info();
-    let page_data = SysRole::select_page(param.inner, pg)
-        .await?;
+    let page_data = SysRole::select_page(param.inner, pg).await?;
 
     Resp::ok(&page_data)
 }
@@ -36,7 +34,6 @@ pub async fn get(ctx: HttpContext) -> HttpResponse {
 pub async fn insert(ctx: HttpContext) -> HttpResponse {
     type Req = SysRole;
 
-    let rid = ctx.id;
     let mut param: Req = ctx.parse_json()?;
     check_required!(param, role_name);
 
@@ -49,25 +46,31 @@ pub async fn insert(ctx: HttpContext) -> HttpResponse {
     if param.permissions.is_none() {
         param.permissions = Some("".to_owned());
     }
+    // 写入数据库
+    let id = param.clone().insert_with_notify().await?.1;
 
-    let id = SysRole::insert(param).await?.1;
+    // 写入审计日志
+    param.role_id = Some(id);
+    param.updated_time = None;
+    audit::log_json(audit::ROLE_ADD, ctx.user_id(), &param);
 
-    let res = SysRole {
+    Resp::ok(&SysRole {
         role_id: Some(id),
         ..Default::default()
-    };
-    emit(rid, ChannelName::ModRole, &RecChanged::with_insert(&res));
-
-    Resp::ok(&res)
+    })
 }
 
 /// 更新单条记录
 pub async fn update(ctx: HttpContext) -> HttpResponse {
     type Req = SysRole;
 
-    let rid = ctx.id;
     let mut param: Req = ctx.parse_json()?;
     check_required!(param, role_id, role_name);
+
+    let orig = match SysRole::select_by_id(param.role_id.unwrap()).await? {
+        Some(v) => v,
+        None => http_bail!("记录不存在"),
+    };
 
     if param.role_type.is_none() {
         param.role_type = Some(String::with_capacity(0))
@@ -78,34 +81,30 @@ pub async fn update(ctx: HttpContext) -> HttpResponse {
         param.permissions = Some("".to_owned());
     }
 
-    let role_id = param.role_id;
-    SysRole::update_by_id(param).await?;
+    let audit_data = audit::diff(&param, &orig, &[SysRole::ROLE_ID], &[SysRole::UPDATED_TIME]);
 
-    let res = SysRole {
+    let role_id = param.role_id;
+    param.update_with_notify().await?;
+
+    audit::log_text(audit::ROLE_UPD, ctx.user_id(), audit_data);
+
+    Resp::ok(&SysRole {
         role_id,
         ..Default::default()
-    };
-    emit(rid, ChannelName::ModRole, &RecChanged::with_update(&res));
-
-    Resp::ok(&res)
+    })
 }
 
 /// 删除记录
 pub async fn del(ctx: HttpContext) -> HttpResponse {
     type Req = super::GetReq;
 
-    let rid = ctx.id;
     let param: Req = ctx.parse_json()?;
-    SysRole::delete_by_id(param.id).await?;
-
-    emit(
-        rid,
-        ChannelName::ModRole,
-        &RecChanged::with_delete(&SysRole {
-            role_id: Some(param.id),
-            ..Default::default()
-        }),
-    );
+    let audit_data = match SysRole::select_by_id(param.id).await? {
+        Some(v) => v,
+        None => http_bail!("记录不存在"),
+    };
+    SysRole::delete_with_notify(param.id).await?;
+    audit::log_json(audit::ROLE_DEL, ctx.user_id(), &audit_data);
 
     Resp::ok_with_empty()
 }
@@ -120,11 +119,7 @@ pub async fn items(ctx: HttpContext) -> HttpResponse {
         Some(v) => v.role_type,
         None => None,
     };
-    let list = SysRole::select_by_role_type(role_type)
-        .await?;
+    let list = SysRole::select_by_role_type(role_type).await?;
 
-    Resp::ok(&Res {
-        total: list.len() as u32,
-        list,
-    })
+    Resp::ok(&Res::with_list(list))
 }

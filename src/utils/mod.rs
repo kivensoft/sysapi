@@ -1,19 +1,25 @@
 //! 实用工具函数单元
+
+#[allow(dead_code)]
+pub mod audit;
 #[allow(dead_code)]
 pub mod bits;
+pub mod consts;
+pub mod kv;
+#[allow(dead_code)]
 pub mod md5_crypt;
-pub mod mq_util;
-pub mod code_tree;
+pub mod multi_cache;
+// #[allow(dead_code)]
+// pub mod multi_level;
+#[allow(dead_code)]
+pub mod rcall;
+#[allow(dead_code)]
+pub mod staticmut;
 // #[allow(dead_code)]
 pub mod time;
+pub mod uni_redis;
 
-pub const PUBLIC_PERMIT_CODE: i16 = -1;
-pub const ANONYMOUS_PERMIT_CODE: i16 = -2;
-pub const INNER_GROUP_CODE: i16 = -1;
-
-pub const PUBLIC_PERMIT_NAME: &str = "公共许可";
-pub const ANONYMOUS_PERMIT_NAME: &str = "匿名许可";
-pub const INNER_GROUP_NAME: &str = "内置权限";
+pub use kv::*;
 
 #[macro_export]
 macro_rules! opt_some {

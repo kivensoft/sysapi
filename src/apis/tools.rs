@@ -1,6 +1,5 @@
 //! 实用工具接口
 use crate::{utils::md5_crypt, AppGlobal};
-use compact_str::{format_compact, CompactString, ToCompactString};
 #[cfg(feature = "fast_qr")]
 use fast_qr::{
     convert::{image::ImageBuilder, Builder, Shape},
@@ -14,27 +13,27 @@ use serde::{Deserialize, Serialize};
 pub async fn ping(ctx: HttpContext) -> HttpResponse {
     #[derive(Deserialize)]
     struct Req {
-        reply: Option<CompactString>,
+        reply: Option<String>,
     }
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Res {
-        reply: CompactString,
+        reply: String,
         now: LocalTime,
-        server: CompactString,
+        server: String,
     }
 
     let reply = match ctx.parse_json_opt::<Req>()? {
         Some(ping_params) => ping_params.reply,
         None => None,
     }
-    .unwrap_or(CompactString::new("pong"));
+    .unwrap_or(String::from("pong"));
 
     Resp::ok(&Res {
         reply,
         now: LocalTime::now(),
-        server: format_compact!("{}/{}", crate::APP_NAME, crate::APP_VER),
+        server: format!("{}/{}", crate::APP_NAME, crate::APP_VER),
     })
 }
 
@@ -55,7 +54,7 @@ pub async fn status(ctx: HttpContext) -> HttpResponse {
     Resp::ok(&Res {
         startup: LocalTime::from_unix_timestamp(app_global.startup_time),
         resp_count: ctx.id,
-        content_path: crate::CONTENT_PATH,
+        content_path: crate::CONTEXT_PATH,
         app_name: crate::APP_NAME,
         app_ver: crate::APP_VER,
     })
@@ -66,10 +65,10 @@ pub async fn ip(ctx: HttpContext) -> HttpResponse {
     #[derive(Serialize)]
     // #[serde(rename_all = "camelCase")]
     struct Res {
-        ip: CompactString,
+        ip: String,
     }
 
-    let ip = ctx.remote_ip().to_compact_string();
+    let ip = ctx.remote_ip().to_string();
 
     Resp::ok(&Res { ip })
 }
@@ -89,7 +88,6 @@ pub async fn qrcode(ctx: HttpContext) -> HttpResponse {
     struct Res {
         text: LocalTime,
     }
-
 
     let param: Req = ctx.parse_json()?;
     let width = param.width.unwrap_or(200);
@@ -113,10 +111,10 @@ pub async fn qrcode(_ctx: HttpContext) -> HttpResponse {
 }
 
 /// 生成账号对应的密码
-pub async fn gen_pass(ctx: HttpContext) -> HttpResponse {
+pub async fn create_password(ctx: HttpContext) -> HttpResponse {
     #[derive(Deserialize, Serialize)]
     struct Req {
-        pass: CompactString,
+        pass: String,
     }
 
     type Res = Req;
@@ -125,6 +123,6 @@ pub async fn gen_pass(ctx: HttpContext) -> HttpResponse {
     let digest = md5_crypt::encrypt(&param.pass)?;
 
     Resp::ok(&Res {
-        pass: CompactString::new(digest),
+        pass: digest,
     })
 }

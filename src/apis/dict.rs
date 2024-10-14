@@ -1,21 +1,28 @@
 //! 字典表接口
+use std::sync::Arc;
+
 use crate::{
-    entities::{sys_dict::SysDict, PageData, PageQuery},
-    services::rmq::ChannelName,
-    utils::mq_util::{emit, RecChanged},
+    apis::UseBuilltinReq,
+    entities::{
+        sys_dict::{SysDict, SysDictExt},
+        PageData, PageQuery,
+    },
+    utils::{audit, IntStr},
 };
-use anyhow_ext::anyhow;
-use httpserver::{check_required, HttpContext, HttpResponse, Resp};
+use httpserver::{
+    check_required, http_bail, http_error, log_debug, HttpContext, HttpResponse, Resp,
+};
 use localtime::LocalTime;
+use serde::Serialize;
 
 /// 记录列表
 pub async fn list(ctx: HttpContext) -> HttpResponse {
     type Req = PageQuery<SysDict>;
+    type Res = PageData<SysDictExt>;
 
     let param: Req = ctx.parse_json()?;
     let pg = param.page_info();
-    let page_data = SysDict::select_page(param.inner, pg)
-        .await?;
+    let page_data: Res = SysDict::select_page(param.inner, pg).await?;
     Resp::ok(&page_data)
 }
 
@@ -26,7 +33,7 @@ pub async fn get(ctx: HttpContext) -> HttpResponse {
     let param: Req = ctx.parse_json()?;
     let rec = SysDict::select_by_id(param.id)
         .await?
-        .ok_or(anyhow!(super::REC_NOT_EXISTS))?;
+        .ok_or(http_error!(super::REC_NOT_EXISTS.to_string()))?;
 
     Resp::ok(&rec)
 }
@@ -36,31 +43,26 @@ pub async fn insert(ctx: HttpContext) -> HttpResponse {
     type Req = SysDict;
     type Res = SysDict;
 
-    let rid = ctx.id;
     let mut param: Req = ctx.parse_json()?;
 
     check_required!(param, dict_type, dict_code, dict_name);
 
     param.dict_id = None;
+    let mut audit_data = param.clone();
     param.updated_time = Some(LocalTime::now());
+    let mut res: Res = param.clone();
 
-    // 新增记录需要设置dict_code的值为所属类别中的最大值 + 1
-    let max_code = SysDict::select_max_code(param.dict_type.unwrap())
-        .await?;
-    param.dict_code = Some(max_code.map_or(0, |v| v + 1));
+    // 写入数据库
+    let id = param.insert_with_notify().await?.1;
 
-    let id = SysDict::insert(param).await?.1;
+    // 写入审计日志
+    audit_data.dict_id = Some(id);
+    audit::log_json(audit::DICT_ADD, ctx.user_id(), &audit_data);
 
-    let res = SysDict {
-        dict_id: Some(id),
-        ..Default::default()
-    };
-    emit(rid, ChannelName::ModDict, &RecChanged::with_insert(&res));
+    // 发送数据变更通知消息
+    res.dict_id = Some(id);
 
-    Resp::ok(&Res {
-        dict_id: Some(id),
-        ..Default::default()
-    })
+    Resp::ok(&res)
 }
 
 /// 更新单条记录
@@ -68,24 +70,26 @@ pub async fn update(ctx: HttpContext) -> HttpResponse {
     type Req = SysDict;
     type Res = SysDict;
 
-    let rid = ctx.id;
     let mut param: Req = ctx.parse_json()?;
-    let dict_id = param.dict_id;
 
-    check_required!(param, dict_id, dict_type, dict_code, dict_name);
+    check_required!(param, dict_id, dict_code, dict_name);
+
+    let orig = match SysDict::select_by_id(param.dict_id.unwrap()).await? {
+        Some(r) => r,
+        None => http_bail!("记录不存在"),
+    };
 
     param.updated_time = Some(LocalTime::now());
+    let audit_data = audit::diff(&param, &orig, &[SysDict::DICT_ID], &[SysDict::UPDATED_TIME]);
 
-    SysDict::update_by_id(param).await?;
+    // 写入数据库
+    param.update_with_notify().await?;
 
-    let res = SysDict {
-        dict_id,
-        ..Default::default()
-    };
-    emit(rid, ChannelName::ModDict, &RecChanged::with_update(&res));
+    // 写入审计日志
+    audit::log_text(audit::DICT_UPD, ctx.user_id(), audit_data);
 
     Resp::ok(&Res {
-        dict_id,
+        dict_id: orig.dict_id,
         ..Default::default()
     })
 }
@@ -94,19 +98,19 @@ pub async fn update(ctx: HttpContext) -> HttpResponse {
 pub async fn del(ctx: HttpContext) -> HttpResponse {
     type Req = super::GetReq;
 
-    let rid = ctx.id;
     let param: Req = ctx.parse_json()?;
-    SysDict::delete_by_id(param.id).await?;
 
-    let ev_data = SysDict {
-        dict_id: Some(param.id),
-        ..Default::default()
+    let orig = match SysDict::select_by_id(param.id).await? {
+        Some(v) => v,
+        None => http_bail!("记录不存在"),
     };
-    emit(
-        rid,
-        ChannelName::ModDict,
-        &RecChanged::with_delete(&ev_data),
-    );
+
+    // 删除记录
+    SysDict::delete_with_notify(param.id).await?;
+
+    // 写入日志审计
+    audit::log_json(audit::DICT_DEL, ctx.user_id(), &orig);
+
 
     Resp::ok_with_empty()
 }
@@ -116,36 +120,58 @@ pub async fn items(ctx: HttpContext) -> HttpResponse {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Req {
-        dict_type: u16,
+        dict_type: u8,
     }
 
-    type Res = PageData<SysDict>;
+    #[derive(Serialize)]
+    struct Res {
+        pub total: usize,
+        pub list: Arc<Vec<SysDict>>,
+    }
 
     let param: Req = ctx.parse_json()?;
-    let list = SysDict::select_by_type(param.dict_type)
-        .await?;
+    let list = SysDict::select_by_type(param.dict_type).await?;
 
-    Resp::ok(&Res {
-        total: list.len() as u32,
-        list,
-    })
+    Resp::ok(&Res{ total: list.len(), list })
 }
 
 /// 批量修改指定类型的字典项集合
 pub async fn batch(ctx: HttpContext) -> HttpResponse {
-    #[derive(serde::Deserialize)]
+    #[derive(serde::Deserialize, serde::Serialize, Clone)]
     #[serde(rename_all = "camelCase")]
     struct Req {
-        dict_type: u16,
-        dict_names: Vec<String>,
+        dict_type: u8,
+        dicts: Vec<SysDict>,
     }
 
-    let rid = ctx.id;
     let param: Req = ctx.parse_json()?;
-    SysDict::batch_update_by_type(param.dict_type, &param.dict_names)
-        .await?;
+    let audit_data = param.clone();
 
-    emit(rid, ChannelName::ModDict, &RecChanged::<()>::with_all());
+    // 写入数据库
+    SysDict::batch_by_type(param.dict_type, param.dicts).await?;
 
+    // 写入审计日志
+    audit::log_json(audit::DICT_BAT, ctx.user_id(), &audit_data);
+
+    Resp::ok_with_empty()
+}
+
+/// 获取权限组列表
+pub async fn permission_groups(ctx: HttpContext) -> HttpResponse {
+    type Req = UseBuilltinReq;
+    type Res = PageData<IntStr>;
+
+    let param = ctx.parse_json_opt::<Req>()?;
+    let use_builltin = param.and_then(|v| v.use_builtin).unwrap_or(false);
+
+    let list = SysDict::get_permission_groups(use_builltin).await?;
+
+    Resp::ok(&Res::with_list(list))
+}
+
+/// 重新排序dict的id值使其连续
+pub async fn resort(ctx: HttpContext) -> HttpResponse {
+    log_debug!(ctx.id, "重新排序{}表", SysDict::TABLE_NAME);
+    SysDict::resort(ctx.id).await?;
     Resp::ok_with_empty()
 }

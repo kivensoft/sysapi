@@ -3,15 +3,14 @@ use crate::{
     entities::{
         self,
         sys_api::{SysApi, SysApiVo},
-        sys_dict::{DictType, SysDict},
-        sys_permission::SysPermission,
+        sys_dict::{DictType, SysDict, BUILTIN_GROUP_CODE, BUILTIN_GROUP_NAME},
+        sys_permission::{
+            SysPermission, BUILTIN_ANONYMOUS_CODE, BUILTIN_ANONYMOUS_NAME, BUILTIN_PUBLIC_CODE,
+            BUILTIN_PUBLIC_NAME,
+        },
         PageData, PageQuery,
     },
-    services::rmq::ChannelName,
-    utils::{
-        self,
-        mq_util::{emit, RecChanged},
-    },
+    utils::audit,
 };
 use anyhow_ext::anyhow;
 use httpserver::{check_required, http_bail, HttpContext, HttpResponse, Resp};
@@ -23,8 +22,7 @@ pub async fn list(ctx: HttpContext) -> HttpResponse {
 
     let param: Req = ctx.parse_json()?;
     let pg = param.page_info();
-    let page_data = SysApi::select_page(param.inner, pg)
-        .await?;
+    let page_data = SysApi::select_page(param.inner, pg).await?;
 
     Resp::ok(&page_data)
 }
@@ -45,62 +43,64 @@ pub async fn get(ctx: HttpContext) -> HttpResponse {
 pub async fn insert(ctx: HttpContext) -> HttpResponse {
     type Req = SysApi;
 
-    let rid = ctx.id;
     let mut param: Req = ctx.parse_json()?;
 
     param.api_id = None;
     param.updated_time = Some(LocalTime::now());
 
-    let id = SysApi::insert(param).await?.1;
+    // 写入数据库
+    let id = param.clone().insert_with_notify().await?.1;
+    // 写入审计日志
+    param.api_id = Some(id);
+    param.updated_time = None;
+    audit::log_json(audit::API_ADD, ctx.user_id(), &param);
 
-    let res = SysApi {
+    Resp::ok(&SysApi {
         api_id: Some(id),
         ..Default::default()
-    };
-    emit(rid, ChannelName::ModApi, &RecChanged::with_insert(&res));
-
-    Resp::ok(&res)
+    })
 }
 
 /// 更新单条记录
 pub async fn update(ctx: HttpContext) -> HttpResponse {
     type Req = SysApi;
 
-    let rid = ctx.id;
     let mut param: Req = ctx.parse_json()?;
 
     check_required!(param, api_id);
 
-    let api_id = param.api_id;
-    param.updated_time = Some(LocalTime::now());
-
-    SysApi::update_by_id(param).await?;
-
-    let res = SysApi {
-        api_id,
-        ..Default::default()
+    let api_id = param.api_id.unwrap();
+    let orig = match SysApi::select_by_id(api_id).await? {
+        Some(v) => v,
+        None => http_bail!("记录不存在"),
     };
-    emit(rid, ChannelName::ModApi, &RecChanged::with_update(&res));
+    param.updated_time = Some(LocalTime::now());
+    let audit_data = audit::diff(&param, &orig, &[SysApi::API_ID], &[SysApi::UPDATED_TIME]);
+    // 写入数据库
+    param.update_with_notify().await?;
 
-    Resp::ok(&res)
+    // 写入审计日志
+    audit::log_text(audit::API_UPD, ctx.user_id(), audit_data);
+
+    Resp::ok(&SysApi {
+        api_id: Some(api_id),
+        ..Default::default()
+    })
 }
 
 /// 删除记录
 pub async fn del(ctx: HttpContext) -> HttpResponse {
     type Req = super::GetReq;
 
-    let rid = ctx.id;
     let param: Req = ctx.parse_json()?;
-    SysApi::delete_by_id(param.id).await?;
 
-    emit(
-        rid,
-        ChannelName::ModApi,
-        &RecChanged::with_delete(&SysApi {
-            api_id: Some(param.id),
-            ..Default::default()
-        }),
-    );
+    let audit_data = match SysApi::select_by_id(param.id).await? {
+        Some(v) => v,
+        None => http_bail!("记录不存在"),
+    };
+
+    SysApi::delete_with_notify(param.id).await?;
+    audit::log_json(audit::API_DEL, ctx.user_id(), &audit_data);
 
     Resp::ok_with_empty()
 }
@@ -110,23 +110,16 @@ pub async fn items(_ctx: HttpContext) -> HttpResponse {
     type Res = PageData<SysApi>;
 
     let list = SysApi::select_all().await?;
-
-    Resp::ok(&Res {
-        total: list.len() as u32,
-        list,
-    })
+    Resp::ok(&Res::with_list(list))
 }
 
 /// 重新排序权限
 pub async fn repermission(ctx: HttpContext) -> HttpResponse {
     type Req = Vec<SysApi>;
 
-    let rid = ctx.id;
     let param: Req = ctx.parse_json()?;
 
-    SysApi::batch_update_permission_code(&param)
-        .await?;
-    emit(rid, ChannelName::ModApi, &RecChanged::<()>::with_all());
+    SysApi::batch_update_permission_code(&param).await?;
 
     Resp::ok_with_empty()
 }
@@ -141,7 +134,9 @@ pub async fn rearrange(ctx: HttpContext) -> HttpResponse {
     if all_records.len() != param.len() {
         http_bail!("记录已经变动, 请刷新后重新排序");
     }
-    SysApi::batch_update_id(&param, all_records).await?;
+
+    SysApi::batch_update_id(&param, all_records.clone()).await?;
+    audit::log_json(audit::API_REARRANGE, ctx.user_id(), &all_records);
 
     Resp::ok_with_empty()
 }
@@ -150,23 +145,18 @@ pub async fn rearrange(ctx: HttpContext) -> HttpResponse {
 pub async fn groups(_ctx: HttpContext) -> HttpResponse {
     type Res = entities::PageData<SysDict>;
 
-    let mut list = SysDict::select_by_type(DictType::PermissionGroup as u16)
-        .await?;
+    let list = SysDict::select_by_type(DictType::PermissionGroup as u8).await?;
+    let mut list = list.as_ref().clone();
 
     // 添加内置权限组
-    list.insert(
-        0,
-        SysDict {
-            dict_code: Some(utils::INNER_GROUP_CODE),
-            dict_name: Some(String::from(utils::INNER_GROUP_NAME)),
-            ..Default::default()
-        },
-    );
+    let dict = SysDict {
+        dict_code: Some(BUILTIN_GROUP_CODE.to_string()),
+        dict_name: Some(String::from(BUILTIN_GROUP_NAME)),
+        ..Default::default()
+    };
+    list.insert(0, dict);
 
-    Resp::ok(&Res {
-        total: list.len() as u32,
-        list,
-    })
+    Resp::ok(&Res::with_list(list))
 }
 
 /// 返回权限列表(带内置权限项)
@@ -179,24 +169,21 @@ pub async fn permissions(_ctx: HttpContext) -> HttpResponse {
     list.insert(
         0,
         SysPermission {
-            group_code: Some(utils::INNER_GROUP_CODE),
-            permission_code: Some(utils::ANONYMOUS_PERMIT_CODE),
-            permission_name: Some(utils::ANONYMOUS_PERMIT_NAME.to_owned()),
+            group_code: Some(BUILTIN_GROUP_CODE),
+            permission_code: Some(BUILTIN_ANONYMOUS_CODE),
+            permission_name: Some(BUILTIN_ANONYMOUS_NAME.to_owned()),
             ..Default::default()
         },
     );
     list.insert(
         1,
         SysPermission {
-            group_code: Some(utils::INNER_GROUP_CODE),
-            permission_code: Some(utils::PUBLIC_PERMIT_CODE),
-            permission_name: Some(utils::PUBLIC_PERMIT_NAME.to_owned()),
+            group_code: Some(BUILTIN_GROUP_CODE),
+            permission_code: Some(BUILTIN_PUBLIC_CODE),
+            permission_name: Some(BUILTIN_PUBLIC_NAME.to_owned()),
             ..Default::default()
         },
     );
 
-    Resp::ok(&Res {
-        total: list.len() as u32,
-        list,
-    })
+    Resp::ok(&Res::with_list(list))
 }

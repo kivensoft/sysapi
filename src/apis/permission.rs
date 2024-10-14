@@ -1,15 +1,18 @@
 //! 权限定义表接口
 use crate::{
+    apis::UseBuilltinReq,
     entities::{
-        sys_dict::{DictType, SysDict},
-        sys_permission::{SysPermission, SysPermissionRearrange},
+        sys_dict::{SysDict, BUILTIN_GROUP_CODE},
+        sys_permission::{
+            SysPermission, SysPermissionRearrange, BUILTIN_ANONYMOUS_CODE, BUILTIN_ANONYMOUS_NAME,
+            BUILTIN_PUBLIC_CODE, BUILTIN_PUBLIC_NAME,
+        },
         PageData, PageQuery,
     },
-    services::rmq::ChannelName,
-    utils::mq_util::{emit, RecChanged},
+    utils::{audit, IntStr},
 };
 use anyhow_ext::anyhow;
-use httpserver::{check_required, HttpContext, HttpResponse, Resp};
+use httpserver::{check_required, http_bail, HttpContext, HttpResponse, Resp};
 use localtime::LocalTime;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -18,7 +21,7 @@ use std::collections::HashMap;
 #[serde(rename_all = "camelCase")]
 struct TreeItem<'a> {
     #[serde(flatten)]
-    dict: &'a SysDict,
+    group: &'a IntStr,
     permissions: Vec<&'a SysPermission>,
 }
 
@@ -28,8 +31,7 @@ pub async fn list(ctx: HttpContext) -> HttpResponse {
 
     let param: Req = ctx.parse_json()?;
     let pg = param.page_info();
-    let page_data = SysPermission::select_page(param.inner, pg)
-        .await?;
+    let page_data = SysPermission::select_page(param.inner, pg).await?;
 
     Resp::ok(&page_data)
 }
@@ -50,7 +52,6 @@ pub async fn get(ctx: HttpContext) -> HttpResponse {
 pub async fn insert(ctx: HttpContext) -> HttpResponse {
     type Req = SysPermission;
 
-    let rid = ctx.id;
     let mut param: Req = ctx.parse_json()?;
     check_required!(param, group_code, permission_code, permission_name);
 
@@ -61,122 +62,130 @@ pub async fn insert(ctx: HttpContext) -> HttpResponse {
     let max_code = SysPermission::select_max_code().await?;
     param.permission_code = Some(max_code.map_or(0, |v| v + 1));
 
-    let id = SysPermission::insert(param).await?.1;
+    let mut audit_data = param.clone();
+    // 写入数据库
+    let id = SysPermission::insert_with_notify(param).await?.1;
 
-    let res = SysPermission {
+    // 写入审计日志
+    audit_data.permission_id = Some(id);
+    audit_data.updated_time = None;
+    audit::log_json(audit::PERMISSIONS_ADD, ctx.user_id(), &audit_data);
+
+    Resp::ok(&SysPermission {
         permission_id: Some(id),
         ..Default::default()
-    };
-    emit(
-        rid,
-        ChannelName::ModPermission,
-        &RecChanged::with_insert(&res),
-    );
-
-    Resp::ok(&res)
+    })
 }
 
 /// 更新单条记录
 pub async fn update(ctx: HttpContext) -> HttpResponse {
     type Req = SysPermission;
 
-    let rid = ctx.id;
     let mut param: Req = ctx.parse_json()?;
-    check_required!(
-        param,
-        permission_id,
-        group_code,
-        permission_code,
-        permission_name
-    );
+    check_required!(param, permission_id, permission_name);
 
-    let permission_id = param.permission_id;
+    let permission_id = param.permission_id.unwrap();
+    let orig = match SysPermission::select_by_id(permission_id).await? {
+        Some(r) => r,
+        None => http_bail!("记录不存在"),
+    };
 
     param.updated_time = Some(LocalTime::now());
-
-    SysPermission::update_by_id(param).await?;
-
-    let res = SysPermission {
-        permission_id,
-        ..Default::default()
-    };
-    emit(
-        rid,
-        ChannelName::ModPermission,
-        &RecChanged::with_update(&res),
+    let audit_diff = audit::diff(
+        &param,
+        &orig,
+        &[SysPermission::PERMISSION_ID],
+        &[SysPermission::UPDATED_TIME],
     );
+    // 写入数据库
+    param.update_with_notify().await?;
 
-    Resp::ok(&res)
+    // 写入审计日志
+    audit::log_text(audit::PERMISSIONS_UPD, ctx.user_id(), audit_diff);
+
+    Resp::ok(&SysPermission {
+        permission_id: Some(permission_id),
+        ..Default::default()
+    })
 }
 
 /// 删除记录
 pub async fn del(ctx: HttpContext) -> HttpResponse {
     type Req = super::GetReq;
 
-    let rid = ctx.id;
     let param: Req = ctx.parse_json()?;
-    SysPermission::delete_by_id(param.id).await?;
-
-    emit(
-        rid,
-        ChannelName::ModPermission,
-        &RecChanged::with_delete(&SysPermission {
-            permission_id: Some(param.id),
-            ..Default::default()
-        }),
-    );
+    let orig = match SysPermission::select_by_id(param.id).await? {
+        Some(v) => v,
+        None => http_bail!("记录不存在"),
+    };
+    // 写入数据库
+    SysPermission::delete_with_notify(param.id).await?;
+    // 写入审计日志
+    audit::log_json(audit::PERMISSIONS_DEL, ctx.user_id(), &orig);
 
     Resp::ok_with_empty()
 }
 
 /// 返回权限的字典表
-pub async fn items(_ctx: HttpContext) -> HttpResponse {
+pub async fn items(ctx: HttpContext) -> HttpResponse {
+    type Req = UseBuilltinReq;
     type Res = PageData<SysPermission>;
 
-    let list = SysPermission::select_all().await?;
+    let param = ctx.parse_json_opt::<Req>()?;
+    let use_builltin = match param {
+        Some(p) => p.use_builtin.unwrap_or(false),
+        None => false,
+    };
 
-    Resp::ok(&Res {
-        total: list.len() as u32,
-        list,
-    })
+    let mut list = SysPermission::select_all().await?;
+    if use_builltin {
+        list.insert(
+            0,
+            SysPermission {
+                group_code: Some(BUILTIN_GROUP_CODE),
+                permission_code: Some(BUILTIN_ANONYMOUS_CODE),
+                permission_name: Some(BUILTIN_ANONYMOUS_NAME.to_string()),
+                ..Default::default()
+            },
+        );
+        list.insert(
+            1,
+            SysPermission {
+                group_code: Some(BUILTIN_GROUP_CODE),
+                permission_code: Some(BUILTIN_PUBLIC_CODE),
+                permission_name: Some(BUILTIN_PUBLIC_NAME.to_string()),
+                ..Default::default()
+            },
+        );
+    }
+
+    Resp::ok(&Res::with_list(list))
 }
 
 /// 返回权限的树形结构
 pub async fn tree(_ctx: HttpContext) -> HttpResponse {
     type Res<'a> = PageData<TreeItem<'a>>;
 
-    let pg_type = DictType::PermissionGroup as u16;
-    let dicts = SysDict::select_by_type(pg_type).await?;
+    let groups = SysDict::get_permission_groups(false).await?;
     let permissions = SysPermission::select_all().await?;
-    let tree = make_tree(&dicts, &permissions);
+    let tree = make_tree(&groups, &permissions);
 
-    Resp::ok(&Res {
-        total: tree.len() as u32,
-        list: tree,
-    })
+    Resp::ok(&Res::with_list(tree))
 }
 
 /// 重新排序权限
 pub async fn rearrange(ctx: HttpContext) -> HttpResponse {
     type Req = Vec<SysPermissionRearrange>;
 
-    let rid = ctx.id;
     let param: Req = ctx.parse_json()?;
+    // 写入数据库
     SysPermission::rearrange(&param).await?;
-
-    emit(
-        rid,
-        ChannelName::ModPermission,
-        &RecChanged::<()>::with_all(),
-    );
-    emit(rid, ChannelName::ModApi, &RecChanged::<()>::with_all());
-    emit(rid, ChannelName::ModRole, &RecChanged::<()>::with_all());
-    emit(rid, ChannelName::ModMenu, &RecChanged::<()>::with_all());
-
+    // 写入审计日志
+    audit::log_json(audit::PERMISSIONS_REARRANGE, ctx.user_id(), &param);
     Resp::ok_with_empty()
 }
 
-fn make_tree<'a>(dicts: &'a [SysDict], permissions: &'a [SysPermission]) -> Vec<TreeItem<'a>> {
+fn make_tree<'a>(groups: &'a [IntStr], permissions: &'a [SysPermission]) -> Vec<TreeItem<'a>> {
     let mut pmap: HashMap<_, Vec<_>> = HashMap::new();
     for item in permissions.iter() {
         pmap.entry(item.group_code.unwrap())
@@ -184,12 +193,11 @@ fn make_tree<'a>(dicts: &'a [SysDict], permissions: &'a [SysPermission]) -> Vec<
             .or_insert_with(|| vec![item]);
     }
 
-    let result = dicts
+    let result = groups
         .iter()
-        .map(|dict| {
-            let permissions = pmap.remove(&dict.dict_code.unwrap()).unwrap_or_default();
-
-            TreeItem { dict, permissions }
+        .map(|group| {
+            let permissions = pmap.remove(&(group.key as i8)).unwrap_or_default();
+            TreeItem { group, permissions }
         })
         .collect();
 
